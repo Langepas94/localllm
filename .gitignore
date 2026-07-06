@@ -1,0 +1,19 @@
+# Личные рабочие данные — не публиковать
+data/
+
+# Локальные настройки Claude Code
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Редакторы / ОС
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

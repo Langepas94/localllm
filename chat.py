@@ -1,0 +1,529 @@
+"""CLI-чат с локальной LLM через LM Studio: память, RAG, автосжатие контекста."""
+
+import argparse
+import sys
+import time
+from pathlib import Path
+
+import httpx
+from openai import OpenAI, APIConnectionError, APIError, BadRequestError
+from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
+
+from gen_params import SPEC, GenParams
+from memory import KEEP_MESSAGES, Session, compress, list_sessions, session_preview
+from rag import RagIndex
+from user_profile import MODES, Profile
+
+DEFAULT_URL = "http://localhost:1234/v1"
+DEFAULT_CONTEXT = 8192        # если LM Studio не сообщил размер контекста
+COMPRESS_THRESHOLD = 0.8      # доля заполнения контекста, при которой жмём историю
+
+HELP_TEXT = """\
+Команды:
+  /help              — эта справка
+  /model             — сменить модель (история сохраняется)
+  /system <текст>    — задать системный промпт; без текста — показать текущий
+  /clear             — очистить историю и саммари текущей сессии
+  /new               — начать новую сессию
+  /sessions          — список сохранённых сессий
+  /load <номер>      — продолжить сессию из списка /sessions
+  /compress          — сжать историю вручную (последние 10 сообщений + саммари)
+  /stats             — заполнение контекста, размер истории, профиль, RAG
+  /profile           — факты о вас (подставляются в промпт только к месту):
+                       add <факт> | edit <n> <текст> | del <n> | triggers <n>
+                       hint <n> <вопрос> | mode smart|always|off
+  /param             — параметры генерации для текущей модели:
+                       <имя> <значение> — задать (temperature, max_tokens, top_p,
+                       top_k, min_p, presence/frequency/repeat_penalty, seed)
+                       <имя> default — вернуть дефолт модели | reset — сбросить все
+  /debug             — вкл/выкл строку статистики после каждого ответа
+  /rag add <путь>    — проиндексировать файл или папку (txt, md, py, ...)
+  /rag on | off      — включить/выключить подстановку контекста из базы
+  /rag status        — что в индексе
+  /rag clear         — очистить индекс
+  /exit, /quit       — выйти
+Ctrl+C во время генерации — прервать ответ, не выходя из чата.\
+"""
+
+# команда -> (описание для меню, подкоманды)
+COMMANDS: dict[str, tuple[str, list[str]]] = {
+    "/help": ("справка по командам", []),
+    "/model": ("сменить модель", []),
+    "/system": ("системный промпт: показать или задать", []),
+    "/clear": ("очистить историю и саммари", []),
+    "/new": ("новая сессия", []),
+    "/sessions": ("список сохранённых сессий", []),
+    "/load": ("продолжить сессию по номеру", []),
+    "/compress": ("сжать историю в саммари", []),
+    "/stats": ("статистика: контекст, история, профиль, RAG", []),
+    "/profile": ("факты о вас для промпта", ["add", "edit", "del", "triggers", "hint", "mode", "show"]),
+    "/param": ("параметры генерации модели", list(SPEC) + ["reset"]),
+    "/rag": ("база знаний из ваших файлов", ["add", "on", "off", "status", "clear"]),
+    "/debug": ("вкл/выкл строку статистики", []),
+    "/exit": ("выйти", []),
+    "/quit": ("выйти", []),
+}
+
+# третий уровень: ("/команда", "подкоманда") -> варианты
+THIRD_LEVEL = {("/profile", "mode"): ["smart", "always", "off"]}
+THIRD_LEVEL.update({("/param", name): ["default"] for name in SPEC})
+
+
+class SlashCompleter(Completer):
+    """Подсказки команд при наборе «/»: команды, подкоманды, значения."""
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if not text.startswith("/"):
+            return
+        parts = text.split(" ")
+        if len(parts) == 1:
+            for cmd, (desc, _) in COMMANDS.items():
+                if cmd.startswith(parts[0]):
+                    yield Completion(cmd, start_position=-len(parts[0]), display_meta=desc)
+        elif len(parts) == 2 and parts[0] in COMMANDS:
+            for sub in COMMANDS[parts[0]][1]:
+                if sub.startswith(parts[1]):
+                    meta = SPEC[sub][3] if parts[0] == "/param" and sub in SPEC else None
+                    yield Completion(sub, start_position=-len(parts[1]), display_meta=meta)
+        elif len(parts) == 3 and (parts[0], parts[1]) in THIRD_LEVEL:
+            for value in THIRD_LEVEL[(parts[0], parts[1])]:
+                if value.startswith(parts[2]):
+                    yield Completion(value, start_position=-len(parts[2]))
+
+
+def api_v0_models(base_url: str) -> list[dict] | None:
+    """Расширенный список моделей LM Studio (/api/v0): тип, state, размер контекста."""
+    api = base_url.rstrip("/").removesuffix("/v1") + "/api/v0/models"
+    try:
+        return httpx.get(api, timeout=5).json()["data"]
+    except Exception:
+        return None
+
+
+def choose_model(client: OpenAI, base_url: str) -> tuple[str, int] | None:
+    """Выбор модели. Возвращает (id, размер контекста) или None при ошибке."""
+    infos = api_v0_models(base_url)
+    if infos is not None:
+        chat_models = [m for m in infos if m.get("type") in ("llm", "vlm")]
+    else:  # /api/v0 недоступен — обычный список без пометок
+        try:
+            chat_models = [{"id": m.id} for m in client.models.list().data]
+        except APIConnectionError:
+            print("Не удалось подключиться к LM Studio. Проверьте, что сервер запущен (Developer -> Start Server).")
+            return None
+    if not chat_models:
+        print("В LM Studio нет чат-моделей. Загрузите модель и повторите.")
+        return None
+
+    def limit_of(m: dict) -> int:
+        return m.get("loaded_context_length") or m.get("max_context_length") or DEFAULT_CONTEXT
+
+    if len(chat_models) == 1:
+        m = chat_models[0]
+        print(f"Модель: {m['id']}")
+        return m["id"], limit_of(m)
+    print("Доступные модели:")
+    for i, m in enumerate(chat_models, 1):
+        mark = "  [загружена]" if m.get("state") == "loaded" else ""
+        print(f"  {i}. {m['id']}{mark}")
+    while True:
+        raw = input(f"Выберите модель [1-{len(chat_models)}]: ").strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(chat_models):
+            m = chat_models[int(raw) - 1]
+            return m["id"], limit_of(m)
+        print("Введите номер из списка.")
+
+
+def find_embedding_model(base_url: str, client: OpenAI) -> str | None:
+    infos = api_v0_models(base_url)
+    if infos:
+        for m in infos:
+            if m.get("type") == "embeddings":
+                return m["id"]
+    try:
+        for m in client.models.list().data:
+            if "embed" in m.id.lower():
+                return m.id
+    except APIConnectionError:
+        pass
+    return None
+
+
+def stream_reply(client: OpenAI, model: str, messages: list[dict], gen_kwargs: dict):
+    """Стримит ответ в stdout. Возвращает (текст | None, usage | None)."""
+    kwargs = dict(model=model, messages=messages, stream=True, **gen_kwargs)
+    try:
+        try:
+            stream = client.chat.completions.create(**kwargs, stream_options={"include_usage": True})
+        except BadRequestError:  # старый LM Studio без include_usage
+            stream = client.chat.completions.create(**kwargs)
+        parts, usage = [], None
+        for chunk in stream:
+            if getattr(chunk, "usage", None):
+                usage = chunk.usage
+            if chunk.choices and chunk.choices[0].delta.content:
+                text = chunk.choices[0].delta.content
+                parts.append(text)
+                print(text, end="", flush=True)
+        print()
+        if not parts:
+            print("[пустой ответ: если задан max_tokens, он мог целиком уйти на размышления модели]")
+        return "".join(parts) or None, usage
+    except KeyboardInterrupt:
+        print("\n[генерация прервана]")
+        return ("".join(parts) or None) if parts else None, None
+    except APIConnectionError:
+        print("\nПотеряно соединение с LM Studio.")
+        return None, None
+    except APIError as e:
+        print(f"\nОшибка API: {e}")
+        return None, None
+
+
+def maybe_compress(session: Session, client: OpenAI, tokens_used: int, context_limit: int) -> None:
+    """Если контекст заполнен на COMPRESS_THRESHOLD — сжимает историю."""
+    if tokens_used <= context_limit * COMPRESS_THRESHOLD:
+        return
+    if len(session.messages) <= KEEP_MESSAGES:
+        print(f"[контекст заполнен на {100 * tokens_used // context_limit}%, "
+              f"но в истории уже только {len(session.messages)} сообщений — сжимать нечего]")
+        return
+    print(f"[контекст заполнен на {100 * tokens_used // context_limit}%, сжимаю историю...]")
+    if compress(session, client):
+        session.save()
+        print(f"[история сжата: саммари + последние {KEEP_MESSAGES} сообщений]")
+    else:
+        print("[не удалось сжать историю, продолжаем как есть]")
+
+
+def print_stats(session: Session, tokens_used: int, context_limit: int, rag_index, rag_on: bool,
+                profile: Profile, params: GenParams) -> None:
+    pct = 100 * tokens_used // context_limit if context_limit else 0
+    print(f"Модель: {session.model}, контекст: {context_limit} токенов")
+    print(f"Последний запрос: ~{tokens_used} токенов ({pct}%), порог сжатия — {int(COMPRESS_THRESHOLD * 100)}%")
+    print(f"История: {len(session.messages)} сообщений, саммари: {'есть' if session.summary else 'нет'}")
+    print(f"Сессия: {session.id} -> {session.path}")
+    print(f"Профиль: {len(profile.facts)} фактов, режим {profile.mode}")
+    overrides = params.for_model(session.model)
+    shown = ", ".join(f"{k}={v}" for k, v in overrides.items()) if overrides else "все — дефолты модели"
+    print(f"Параметры генерации: {shown}")
+    if rag_index and rag_index.entries:
+        state = "включён" if rag_on else "выключен"
+        print(f"RAG: {state}, {len(rag_index.entries)} чанков из {len(rag_index.sources())} файлов")
+    else:
+        print("RAG: индекс пуст (/rag add <путь>)")
+
+
+def handle_rag_command(arg: str, rag_index, rag_on: bool, client: OpenAI, base_url: str):
+    """Обрабатывает /rag ... Возвращает (rag_index, rag_on)."""
+    sub, _, rest = arg.partition(" ")
+    sub, rest = sub.lower(), rest.strip()
+    if rag_index is None and sub in ("add", "on", "status", "clear"):
+        embed_model = find_embedding_model(base_url, client)
+        if not embed_model:
+            print("В LM Studio не найдена эмбеддинг-модель. Скачайте, например, nomic-embed-text.")
+            return None, False
+        rag_index = RagIndex(client, embed_model)
+        print(f"[эмбеддинги: {embed_model}]")
+    if sub == "add":
+        if not rest:
+            print("Использование: /rag add <путь к файлу или папке>")
+        else:
+            try:
+                files, chunks = rag_index.add_path(rest)
+                print(f"Проиндексировано: {files} файлов, {chunks} чанков. RAG включён.")
+                rag_on = True
+            except FileNotFoundError:
+                print(f"Не найдено: {rest}")
+            except (APIConnectionError, APIError) as e:
+                print(f"Ошибка эмбеддингов: {e}")
+    elif sub == "on":
+        if rag_index.entries:
+            rag_on = True
+            print("RAG включён.")
+        else:
+            print("Индекс пуст — сначала /rag add <путь>.")
+    elif sub == "off":
+        rag_on = False
+        print("RAG выключен.")
+    elif sub == "status":
+        if rag_index.entries:
+            print(f"RAG {'включён' if rag_on else 'выключен'}, {len(rag_index.entries)} чанков:")
+            for src, n in rag_index.sources().items():
+                print(f"  {src} — {n}")
+        else:
+            print("Индекс пуст.")
+    elif sub == "clear":
+        rag_index.clear()
+        rag_on = False
+        print("Индекс очищен, RAG выключен.")
+    else:
+        print("Подкоманды: /rag add <путь> | on | off | status | clear")
+    return rag_index, rag_on
+
+
+def handle_profile_command(arg: str, profile: Profile, model: str) -> None:
+    sub, _, rest = arg.partition(" ")
+    sub, rest = sub.lower(), rest.strip()
+    if not sub or sub == "show":
+        if not profile.facts:
+            print("Профиль пуст. /profile add <факт о вас> — добавить.")
+            return
+        print(f"Режим: {profile.mode} (smart — только релевантные факты, always — все, off — не использовать)")
+        for i, f in enumerate(profile.facts, 1):
+            print(f"  {i}. {f['text']} ({len(f['triggers'])} триггеров)")
+    elif sub == "add":
+        if not rest:
+            print("Использование: /profile add <факт о вас>")
+            return
+        print("[генерирую триггеры — примеры вопросов, при которых факт пригодится...]")
+        triggers = profile.add(rest, model)
+        if triggers:
+            print(f"Добавлено. Триггеры ({len(triggers)}), например: {'; '.join(triggers[:3])}")
+        else:
+            print("Добавлено, но триггеры сгенерировать не удалось — факт будет подставляться всегда.")
+    elif sub == "edit":
+        num, _, text = rest.partition(" ")
+        text = text.strip()
+        if num.isdigit() and 1 <= int(num) <= len(profile.facts) and text:
+            print("[генерирую триггеры заново...]")
+            profile.edit(int(num) - 1, text, model)
+            print("Факт обновлён.")
+        else:
+            print("Использование: /profile edit <номер> <новый текст>")
+    elif sub == "del":
+        if rest.isdigit() and 1 <= int(rest) <= len(profile.facts):
+            removed = profile.facts[int(rest) - 1]["text"]
+            profile.delete(int(rest) - 1)
+            print(f"Удалено: {removed}")
+        else:
+            print("Использование: /profile del <номер>")
+    elif sub == "triggers":
+        if rest.isdigit() and 1 <= int(rest) <= len(profile.facts):
+            f = profile.facts[int(rest) - 1]
+            print(f"Триггеры факта «{f['text']}»:")
+            for t in f["triggers"] or ["(нет — факт подставляется всегда)"]:
+                print(f"  - {t}")
+        else:
+            print("Использование: /profile triggers <номер>")
+    elif sub == "hint":
+        num, _, text = rest.partition(" ")
+        text = text.strip()
+        if num.isdigit() and 1 <= int(num) <= len(profile.facts) and text:
+            if profile.add_trigger(int(num) - 1, text):
+                print("Триггер добавлен.")
+            else:
+                print("Не удалось получить эмбеддинг — триггер не добавлен.")
+        else:
+            print("Использование: /profile hint <номер факта> <пример вопроса>")
+    elif sub == "mode":
+        if rest in MODES:
+            profile.mode = rest
+            profile.save()
+            print(f"Режим профиля: {rest}")
+        else:
+            print("Режимы: smart (только релевантные факты) | always (все) | off (не использовать)")
+    else:
+        print("Подкоманды: /profile [show] | add <факт> | edit <n> <текст> | del <n> | "
+              "triggers <n> | hint <n> <вопрос> | mode smart|always|off")
+
+
+def handle_param_command(arg: str, params: GenParams, model: str) -> None:
+    name, _, value = arg.partition(" ")
+    name, value = name.lower(), value.strip()
+    if not name:
+        current = params.for_model(model)
+        print(f"Параметры генерации для {model} (не заданные берутся из пресета модели в LM Studio):")
+        for p, (_, _, _, desc) in SPEC.items():
+            shown = current.get(p, "дефолт модели")
+            print(f"  {p} = {shown}  — {desc}")
+        print("Задать: /param <имя> <значение>; сбросить: /param <имя> default; всё: /param reset")
+    elif name == "reset":
+        params.reset(model)
+        print(f"Все параметры для {model} сброшены на дефолты модели.")
+    elif value.lower() in ("default", "дефолт", "-"):
+        if params.unset(model, name):
+            print(f"{name} сброшен на дефолт модели.")
+        else:
+            print(f"{name} и так не был задан (действует дефолт модели).")
+    elif not value:
+        print("Использование: /param <имя> <значение> | /param <имя> default | /param reset")
+    else:
+        try:
+            print(f"{name} = {params.set(model, name, value)}")
+        except ValueError as e:
+            print(e)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Чат с локальной LLM через LM Studio")
+    parser.add_argument("--url", default=DEFAULT_URL, help=f"адрес API LM Studio (по умолчанию {DEFAULT_URL})")
+    parser.add_argument("--model", help="id модели (по умолчанию — выбор из списка)")
+    parser.add_argument("--system", default="", help="системный промпт для новой сессии")
+    parser.add_argument("--temperature", type=float, default=None,
+                        help="температура на эту сессию (по умолчанию — дефолт модели)")
+    args = parser.parse_args()
+
+    client = OpenAI(base_url=args.url, api_key="lm-studio")
+
+    context_limit = DEFAULT_CONTEXT
+    if args.model:
+        model = args.model
+        infos = api_v0_models(args.url) or []
+        info = next((m for m in infos if m["id"] == model), None)
+        if info:
+            context_limit = info.get("loaded_context_length") or info.get("max_context_length") or DEFAULT_CONTEXT
+    else:
+        chosen = choose_model(client, args.url)
+        if not chosen:
+            return 1
+        model, context_limit = chosen
+
+    session = Session(system_prompt=args.system, model=model)
+    profile = Profile(client, find_embedding_model(args.url, client))
+    params = GenParams()
+    if args.temperature is not None:  # флаг действует только на эту сессию
+        params.set(model, "temperature", str(args.temperature), persist=False)
+    rag_index = None
+    rag_on = False
+    debug = True   # строка статистики после каждого ответа
+    tokens_used = 0  # ~размер последнего запроса по данным usage или оценке
+
+    print(f"\nЧат с {model} (контекст {context_limit} токенов). /help — список команд, «/» покажет подсказки.")
+    if list_sessions():
+        print("Есть сохранённые сессии: /sessions — список, /load <номер> — продолжить.")
+    print()
+
+    # подсказки команд только в интерактивном терминале; при пайпе — обычный input
+    prompt_session = PromptSession(completer=SlashCompleter(), complete_while_typing=True) \
+        if sys.stdin.isatty() else None
+
+    while True:
+        try:
+            if prompt_session:
+                user_input = prompt_session.prompt("Вы: ").strip()
+            else:
+                # при пайпе из PowerShell в начало потока попадает BOM
+                user_input = input("Вы: ").strip().strip("﻿").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nПока!")
+            return 0
+
+        if not user_input:
+            continue
+
+        if user_input.startswith("/"):
+            cmd, _, arg = user_input.partition(" ")
+            cmd, arg = cmd.lower(), arg.strip()
+            if cmd in ("/exit", "/quit"):
+                print("Пока!")
+                return 0
+            elif cmd == "/help":
+                print(HELP_TEXT)
+            elif cmd == "/clear":
+                session.messages.clear()
+                session.summary = ""
+                session.save()
+                print("История и саммари очищены.")
+            elif cmd == "/new":
+                session = Session(system_prompt=args.system, model=model)
+                tokens_used = 0
+                print("Новая сессия.")
+            elif cmd == "/system":
+                if arg:
+                    session.system_prompt = arg
+                    session.save()
+                    print("Системный промпт задан.")
+                else:
+                    print(f"Текущий системный промпт: {session.system_prompt or '(не задан)'}")
+            elif cmd == "/model":
+                chosen = choose_model(client, args.url)
+                if chosen:
+                    model, context_limit = chosen
+                    session.model = model
+                    session.save()
+                    print(f"Модель: {model} (контекст {context_limit}). История сохранена.")
+            elif cmd == "/sessions":
+                paths = list_sessions()
+                if not paths:
+                    print("Сохранённых сессий нет.")
+                for i, p in enumerate(paths, 1):
+                    print(f"  {i}. {session_preview(p)}")
+            elif cmd == "/load":
+                paths = list_sessions()
+                if arg.isdigit() and 1 <= int(arg) <= len(paths):
+                    session = Session.from_file(paths[int(arg) - 1])
+                    if session.model != model and session.model:
+                        print(f"[сессия велась с {session.model}, сейчас будет использоваться {model}]")
+                    session.model = model
+                    tokens_used = session.estimate_tokens()
+                    print(f"Загружена сессия {session.id}: {len(session.messages)} сообщений"
+                          f"{', есть саммари' if session.summary else ''}.")
+                else:
+                    print("Использование: /load <номер из /sessions>")
+            elif cmd == "/compress":
+                if compress(session, client):
+                    session.save()
+                    print(f"История сжата: саммари + последние {KEEP_MESSAGES} сообщений.")
+                else:
+                    print(f"Сжимать нечего: в истории не больше {KEEP_MESSAGES} сообщений.")
+            elif cmd == "/stats":
+                print_stats(session, tokens_used, context_limit, rag_index, rag_on, profile, params)
+            elif cmd == "/rag":
+                rag_index, rag_on = handle_rag_command(arg, rag_index, rag_on, client, args.url)
+            elif cmd == "/profile":
+                handle_profile_command(arg, profile, model)
+            elif cmd == "/param":
+                handle_param_command(arg, params, model)
+            elif cmd == "/debug":
+                debug = not debug
+                print(f"Дебаг-строка {'включена' if debug else 'выключена'}.")
+            else:
+                print(f"Неизвестная команда: {cmd}. /help — список команд.")
+            continue
+
+        # обычное сообщение: профиль + RAG -> запрос -> сохранение -> сжатие
+        rag_context = ""
+        if rag_on and rag_index and rag_index.entries:
+            try:
+                hits = rag_index.search(user_input)
+                rag_context = "\n---\n".join(f"[{Path(h['source']).name}] {h['text']}" for h in hits)
+                if hits and debug:
+                    print(f"[RAG: подставлено {len(hits)} фрагментов]")
+            except (APIConnectionError, APIError) as e:
+                print(f"[RAG не сработал: {e}]")
+
+        profile_facts = profile.relevant(user_input)
+        profile_block = "\n".join(f"- {f}" for f in profile_facts)
+        if profile_facts and debug:
+            print(f"[профиль: {'; '.join(f[:40] for f in profile_facts)}]")
+
+        session.messages.append({"role": "user", "content": user_input})
+        messages = session.build_messages(rag_context, profile_block)
+
+        print("LLM: ", end="", flush=True)
+        started = time.perf_counter()
+        reply, usage = stream_reply(client, model, messages, params.request_kwargs(model))
+        elapsed = time.perf_counter() - started
+        if not reply:
+            session.messages.pop()  # не сохраняем вопрос без ответа
+            continue
+        session.messages.append({"role": "assistant", "content": reply})
+        session.save()
+
+        tokens_used = usage.total_tokens if usage else session.estimate_tokens()
+        if debug:
+            pct = 100 * tokens_used // context_limit
+            if usage:
+                tps = usage.completion_tokens / elapsed if elapsed > 0 else 0
+                print(f"[{elapsed:.1f} с | промпт {usage.prompt_tokens} + ответ {usage.completion_tokens} "
+                      f"= {usage.total_tokens} ток. | {tps:.0f} ток/с | контекст {pct}% из {context_limit}]")
+            else:
+                print(f"[{elapsed:.1f} с | ~{tokens_used} ток. (оценка) | контекст {pct}% из {context_limit}]")
+        maybe_compress(session, client, tokens_used, context_limit)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

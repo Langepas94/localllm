@@ -1,3 +1,4 @@
 openai>=1.0
 httpx>=0.23
 prompt_toolkit>=3.0
+pypdf>=4.0

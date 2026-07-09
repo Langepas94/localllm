@@ -12,7 +12,10 @@ from prompt_toolkit.completion import Completer, Completion
 
 from gen_params import SPEC, GenParams
 from memory import KEEP_MESSAGES, Session, compress, list_sessions, session_preview
-from rag import INDEX_PATH, RagIndex
+from rag import (
+    ANSWER_MIN_SCORE, INDEX_PATH, RERANK_CANDIDATES, TOP_K, RagIndex,
+    relevance_filter, rerank, rewrite_query, section_of,
+)
 from user_profile import MODES, Profile
 
 DEFAULT_URL = "http://localhost:1234/v1"
@@ -38,10 +41,13 @@ HELP_TEXT = """\
                        top_k, min_p, presence/frequency/repeat_penalty, seed)
                        <имя> default — вернуть дефолт модели | reset — сбросить все
   /debug             — вкл/выкл строку статистики после каждого ответа
-  /rag add <путь>    — проиндексировать файл или папку (txt, md, py, ...)
+  /rag add <путь>    — проиндексировать файл или папку (txt, md, pdf, py, ...)
   /rag on | off      — включить/выключить подстановку контекста из базы
-  /rag status        — что в индексе
+  /rag status        — что в индексе и какие улучшения ретривала включены
   /rag clear         — очистить индекс
+  /rag rewrite on|off — переписывать запрос по истории перед поиском
+  /rag rerank on|off  — LLM-переранжирование расширенной выборки
+  /rag filter on|off  — отсекать слабые по близости фрагменты (без LLM)
   /exit, /quit       — выйти
 Ctrl+C во время генерации — прервать ответ, не выходя из чата.\
 """
@@ -59,7 +65,7 @@ COMMANDS: dict[str, tuple[str, list[str]]] = {
     "/stats": ("статистика: контекст, история, профиль, RAG", []),
     "/profile": ("факты о вас для промпта", ["add", "edit", "del", "triggers", "hint", "mode", "show"]),
     "/param": ("параметры генерации модели", list(SPEC) + ["reset"]),
-    "/rag": ("база знаний из ваших файлов", ["add", "on", "off", "status", "clear"]),
+    "/rag": ("база знаний из ваших файлов", ["add", "on", "off", "status", "clear", "rewrite", "rerank", "filter"]),
     "/debug": ("вкл/выкл строку статистики", []),
     "/exit": ("выйти", []),
     "/quit": ("выйти", []),
@@ -68,6 +74,7 @@ COMMANDS: dict[str, tuple[str, list[str]]] = {
 # третий уровень: ("/команда", "подкоманда") -> варианты
 THIRD_LEVEL = {("/profile", "mode"): ["smart", "always", "off"]}
 THIRD_LEVEL.update({("/param", name): ["default"] for name in SPEC})
+THIRD_LEVEL.update({("/rag", sub): ["on", "off"] for sub in ("rewrite", "rerank", "filter")})
 
 
 class SlashCompleter(Completer):
@@ -137,14 +144,20 @@ def choose_model(client: OpenAI, base_url: str) -> tuple[str, int] | None:
 
 
 def find_embedding_model(base_url: str, client: OpenAI) -> str | None:
+    # reranker'ы LM Studio помечает type=embeddings, но для векторного поиска они
+    # не годятся (дают relevance-скор пары, а не эмбеддинг) — исключаем по имени.
+    def ok(mid: str) -> bool:
+        return "rerank" not in mid.lower()
+
     infos = api_v0_models(base_url)
     if infos:
-        for m in infos:
-            if m.get("type") == "embeddings":
-                return m["id"]
+        embs = [m for m in infos if m.get("type") == "embeddings" and ok(m["id"])]
+        embs.sort(key=lambda m: m.get("state") != "loaded")  # уже загруженные первыми
+        if embs:
+            return embs[0]["id"]
     try:
         for m in client.models.list().data:
-            if "embed" in m.id.lower():
+            if "embed" in m.id.lower() and ok(m.id):
                 return m.id
     except APIConnectionError:
         pass
@@ -226,10 +239,21 @@ def print_stats(session: Session, tokens_used: int, context_limit: int, rag_inde
         print("RAG: индекс пуст (/rag add <путь>)")
 
 
-def handle_rag_command(arg: str, rag_index, rag_on: bool, client: OpenAI, base_url: str):
-    """Обрабатывает /rag ... Возвращает (rag_index, rag_on)."""
+RETR_LABELS = {"rewrite": "Переписывание запроса", "rerank": "LLM-переранжирование",
+               "filter": "Фильтр релевантности"}
+
+
+def handle_rag_command(arg: str, rag_index, rag_on: bool, retr: dict, client: OpenAI, base_url: str):
+    """Обрабатывает /rag ... Возвращает (rag_index, rag_on); retr правит на месте."""
     sub, _, rest = arg.partition(" ")
     sub, rest = sub.lower(), rest.strip()
+    if sub in RETR_LABELS:
+        if rest in ("on", "off"):
+            retr[sub] = rest == "on"
+            print(f"{RETR_LABELS[sub]}: {'включено' if retr[sub] else 'выключено'}.")
+        else:
+            print(f"Использование: /rag {sub} on|off")
+        return rag_index, rag_on
     if rag_index is None and sub in ("add", "on", "status", "clear"):
         embed_model = find_embedding_model(base_url, client)
         if not embed_model:
@@ -247,6 +271,8 @@ def handle_rag_command(arg: str, rag_index, rag_on: bool, client: OpenAI, base_u
                 rag_on = True
             except FileNotFoundError:
                 print(f"Не найдено: {rest}")
+            except RuntimeError as e:
+                print(str(e))
             except (APIConnectionError, APIError) as e:
                 print(f"Ошибка эмбеддингов: {e}")
     elif sub == "on":
@@ -265,12 +291,15 @@ def handle_rag_command(arg: str, rag_index, rag_on: bool, client: OpenAI, base_u
                 print(f"  {src} — {n}")
         else:
             print("Индекс пуст.")
+        enh = ", ".join(f"{name}={'вкл' if retr[key] else 'выкл'}"
+                        for key, name in RETR_LABELS.items())
+        print(f"Ретривал: {enh}")
     elif sub == "clear":
         rag_index.clear()
         rag_on = False
         print("Индекс очищен, RAG выключен.")
     else:
-        print("Подкоманды: /rag add <путь> | on | off | status | clear")
+        print("Подкоманды: /rag add <путь> | on | off | status | clear | rewrite/rerank/filter on|off")
     return rag_index, rag_on
 
 
@@ -399,6 +428,8 @@ def main() -> int:
         params.set(model, "temperature", str(args.temperature), persist=False)
     rag_index = None
     rag_on = False
+    # улучшения ретривала (работают только при включённом RAG)
+    retr = {"rewrite": True, "rerank": True, "filter": True}
     debug = True   # строка статистики после каждого ответа
     tokens_used = 0  # ~размер последнего запроса по данным usage или оценке
 
@@ -492,7 +523,7 @@ def main() -> int:
             elif cmd == "/stats":
                 print_stats(session, tokens_used, context_limit, rag_index, rag_on, profile, params)
             elif cmd == "/rag":
-                rag_index, rag_on = handle_rag_command(arg, rag_index, rag_on, client, args.url)
+                rag_index, rag_on = handle_rag_command(arg, rag_index, rag_on, retr, client, args.url)
             elif cmd == "/profile":
                 handle_profile_command(arg, profile, model)
             elif cmd == "/param":
@@ -506,12 +537,38 @@ def main() -> int:
 
         # обычное сообщение: профиль + RAG -> запрос -> сохранение -> сжатие
         rag_context = ""
+        rag_hits: list[dict] = []
         if rag_on and rag_index and rag_index.entries:
             try:
-                hits = rag_index.search(user_input)
-                rag_context = "\n---\n".join(f"[{Path(h['source']).name}] {h['text']}" for h in hits)
-                if hits and debug:
-                    print(f"[RAG: подставлено {len(hits)} фрагментов]")
+                # rewrite -> шире достаём -> фильтр релевантности -> rerank -> топ-K
+                query = user_input
+                if retr["rewrite"]:
+                    query = rewrite_query(client, model, session.messages, user_input)
+                    if debug and query != user_input:
+                        print(f"[rewrite: {query[:80]}]")
+                hits = rag_index.search(query, top_k=RERANK_CANDIDATES if retr["rerank"] else TOP_K)
+                best_score = hits[0]["score"] if hits else 0.0
+                if retr["filter"]:
+                    hits = relevance_filter(hits)
+                hits = rerank(client, model, query, hits) if retr["rerank"] else hits[:TOP_K]
+                # порог уверенности: релевантного нет -> честно «не знаю», без вызова модели
+                if not hits or best_score < ANSWER_MIN_SCORE:
+                    if debug:
+                        print(f"[RAG: релевантность низкая (лучший score {best_score:.2f} "
+                              f"< {ANSWER_MIN_SCORE}) — отвечаю «не знаю»]")
+                    print("LLM: Не знаю — в проиндексированных документах нет достаточно "
+                          "релевантной информации по вашему вопросу. Уточните формулировку "
+                          "или добавьте нужный документ через «/rag add».")
+                    continue
+                rag_hits = hits
+                chunks = "\n---\n".join(f"[{i}] {h['text']}" for i, h in enumerate(hits, 1))
+                rag_context = (
+                    "Отвечай, опираясь ТОЛЬКО на пронумерованные фрагменты ниже. Если в них "
+                    "нет ответа — напиши «Не знаю» и попроси уточнить, ничего не выдумывай.\n\n"
+                    + chunks
+                )
+                if debug:
+                    print(f"[RAG: {len(hits)} фрагментов, лучший score {best_score:.2f}]")
             except (APIConnectionError, APIError) as e:
                 print(f"[RAG не сработал: {e}]")
 
@@ -532,6 +589,17 @@ def main() -> int:
             continue
         session.messages.append({"role": "assistant", "content": reply})
         session.save()
+
+        # структура ответа: источники и цитаты собираем из самих чанков (без LLM)
+        if rag_hits:
+            print("\nИсточники:")
+            for i, h in enumerate(rag_hits, 1):
+                print(f"  [{i}] {Path(h['source']).name} · {section_of(h['text'])} "
+                      f"· chunk {h['chunk_id']} · score {h['score']:.2f}")
+            print("Цитаты:")
+            for i, h in enumerate(rag_hits, 1):
+                frag = " ".join(h["text"].split())[:220]
+                print(f"  [{i}] {frag}…")
 
         tokens_used = usage.total_tokens if usage else session.estimate_tokens()
         if debug:

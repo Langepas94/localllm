@@ -10,11 +10,11 @@ CLI-чат с локальной LLM через LM Studio (OpenAI-совмест
 
 - `chat.py` — точка входа, REPL, команды, выбор модели, стриминг, триггер сжатия;
 - `memory.py` — класс `Session` (история, системный промпт, саммари), сохранение в `data/sessions/*.json`, функция `compress`;
-- `rag.py` — `RagIndex`: чанкинг, эмбеддинги через LM Studio, косинусный поиск, индекс в `data/rag_index.json`;
+- `rag.py` — `RagIndex`: чанкинг (structured по статьям + скользящее окно), извлечение текста из PDF, эмбеддинги через LM Studio, косинусный поиск, индекс в `data/rag_index.json`; плюс слой улучшения ретривала: `rewrite_query` (переписывание запроса по истории), `relevance_filter` (отсев слабых по косинусу, без LLM), `rerank` (LLM-переранжирование + фильтр релевантности); порог `ANSWER_MIN_SCORE` (ниже — детерминированный ответ «не знаю» без вызова модели) и `section_of` для структурированного вывода (ответ + источники + цитаты, собираются из чанков в `main`);
 - `user_profile.py` — `Profile`: факты о пользователе с «триггерами», селективная подстановка в системный промпт, `data/profile.json`;
 - `gen_params.py` — `GenParams`: пер-модельные параметры генерации (temperature, max_tokens, ...), `data/params.json`.
 
-Зависимости: `openai`, `httpx`, `prompt_toolkit`. Папка `data/` — рабочие данные, не код.
+Зависимости: `openai`, `httpx`, `prompt_toolkit`, `pypdf` (текст из PDF). Папка `data/` — рабочие данные, не код.
 
 ## Команды
 
@@ -24,7 +24,14 @@ python chat.py                    # запуск чата
 python chat.py --model <id> --system "..." --temperature 0.5 --url <url>
 ```
 
-Тестов и линтера нет. Ручная проверка: запустить сервер в LM Studio (Developer → Start Server) и `python chat.py`. Без сервера скрипт печатает подсказку и завершается с кодом 1 — это ожидаемое поведение. Скриптовый прогон для проверки (кириллица в пайпе требует UTF-8 без BOM):
+Автотесты — на `unittest` (без зависимостей), только для RAG, гоняются offline (эмбеддинги подменяются детерминированным фейком в `tests/test_rag.py`):
+
+```powershell
+python -m unittest discover -s tests -v                       # весь набор
+$env:RAG_TEST_PDF="C:\путь\кодекс.pdf"; python -m unittest discover -s tests   # + проверка на реальном PDF
+```
+
+`TestRealPdf` пропускается, если не задан `RAG_TEST_PDF`. Линтера нет. Ручная проверка чата: запустить сервер в LM Studio (Developer → Start Server) и `python chat.py`. Без сервера скрипт печатает подсказку и завершается с кодом 1 — это ожидаемое поведение. Скриптовый прогон (кириллица в пайпе требует UTF-8 без BOM):
 
 ```powershell
 $OutputEncoding = New-Object System.Text.UTF8Encoding($false); $env:PYTHONIOENCODING='utf-8'

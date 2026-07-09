@@ -12,7 +12,7 @@ from prompt_toolkit.completion import Completer, Completion
 
 from gen_params import SPEC, GenParams
 from memory import KEEP_MESSAGES, Session, compress, list_sessions, session_preview
-from rag import RagIndex
+from rag import INDEX_PATH, RagIndex
 from user_profile import MODES, Profile
 
 DEFAULT_URL = "http://localhost:1234/v1"
@@ -149,6 +149,16 @@ def find_embedding_model(base_url: str, client: OpenAI) -> str | None:
     except APIConnectionError:
         pass
     return None
+
+
+def warm_up_embeddings(client: OpenAI, embed_model: str) -> bool:
+    """Заранее подгружает эмбеддинг-модель в LM Studio (через JIT), чтобы RAG и
+    профиль не тормозили на первом запросе. False — если JIT выключен/ошибка."""
+    try:
+        client.embeddings.create(model=embed_model, input=["прогрев"])
+        return True
+    except Exception:
+        return False
 
 
 def stream_reply(client: OpenAI, model: str, messages: list[dict], gen_kwargs: dict):
@@ -382,7 +392,8 @@ def main() -> int:
         model, context_limit = chosen
 
     session = Session(system_prompt=args.system, model=model)
-    profile = Profile(client, find_embedding_model(args.url, client))
+    embed_model = find_embedding_model(args.url, client)
+    profile = Profile(client, embed_model)
     params = GenParams()
     if args.temperature is not None:  # флаг действует только на эту сессию
         params.set(model, "temperature", str(args.temperature), persist=False)
@@ -394,6 +405,15 @@ def main() -> int:
     print(f"\nЧат с {model} (контекст {context_limit} токенов). /help — список команд, «/» покажет подсказки.")
     if list_sessions():
         print("Есть сохранённые сессии: /sessions — список, /load <номер> — продолжить.")
+
+    # прогрев эмбеддинг-модели, если она понадобится (профиль smart с фактами или есть RAG-индекс)
+    needs_embeddings = (profile.mode == "smart" and profile.facts) or INDEX_PATH.exists()
+    if embed_model and needs_embeddings:
+        print(f"Загружаю эмбеддинг-модель {embed_model}...", end="", flush=True)
+        if warm_up_embeddings(client, embed_model):
+            print(" готово.")
+        else:
+            print(" не удалось (включите JIT loading в LM Studio или загрузите её вручную).")
     print()
 
     # подсказки команд только в интерактивном терминале; при пайпе — обычный input

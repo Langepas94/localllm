@@ -10,7 +10,7 @@ from openai import OpenAI, APIConnectionError, APIError, BadRequestError
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 
-from gen_params import SPEC, GenParams
+from gen_params import PRESETS, SPEC, GenParams
 from memory import KEEP_MESSAGES, Session, compress, list_sessions, session_preview
 from rag import (
     ANSWER_MIN_SCORE, INDEX_PATH, RERANK_CANDIDATES, TOP_K, RagIndex,
@@ -36,9 +36,13 @@ HELP_TEXT = """\
   /profile           — факты о вас (подставляются в промпт только к месту):
                        add <факт> | edit <n> <текст> | del <n> | triggers <n>
                        hint <n> <вопрос> | mode smart|always|off
+  /legal on | off    — юридический режим разом: систем-промпт юр-агента + параметры
+                       генерации (preset legal) + ретривал (top_k, дедуп по статье, фильтр).
+                       off — базовый вариант для сравнения «до/после». Главный демо-переключатель.
   /param             — параметры генерации для текущей модели:
-                       <имя> <значение> — задать (temperature, max_tokens, top_p,
-                       top_k, min_p, presence/frequency/repeat_penalty, seed)
+                       <имя> <значение> — задать (temperature, max_tokens, context_window,
+                       top_p, top_k, min_p, presence/frequency/repeat_penalty, seed)
+                       preset legal — пресет юр-агента | preset off — снять (дефолты модели)
                        <имя> default — вернуть дефолт модели | reset — сбросить все
   /debug             — вкл/выкл строку статистики после каждого ответа
   /rag add <путь>    — проиндексировать файл или папку (txt, md, pdf, py, ...)
@@ -64,7 +68,8 @@ COMMANDS: dict[str, tuple[str, list[str]]] = {
     "/compress": ("сжать историю в саммари", []),
     "/stats": ("статистика: контекст, история, профиль, RAG", []),
     "/profile": ("факты о вас для промпта", ["add", "edit", "del", "triggers", "hint", "mode", "show"]),
-    "/param": ("параметры генерации модели", list(SPEC) + ["reset"]),
+    "/legal": ("юридический режим (параметры + ретривал) вкл/выкл", ["on", "off"]),
+    "/param": ("параметры генерации модели", list(SPEC) + ["preset", "reset"]),
     "/rag": ("база знаний из ваших файлов", ["add", "on", "off", "status", "clear", "rewrite", "rerank", "filter"]),
     "/debug": ("вкл/выкл строку статистики", []),
     "/exit": ("выйти", []),
@@ -74,7 +79,31 @@ COMMANDS: dict[str, tuple[str, list[str]]] = {
 # третий уровень: ("/команда", "подкоманда") -> варианты
 THIRD_LEVEL = {("/profile", "mode"): ["smart", "always", "off"]}
 THIRD_LEVEL.update({("/param", name): ["default"] for name in SPEC})
+THIRD_LEVEL[("/param", "preset")] = list(PRESETS) + ["off"]
 THIRD_LEVEL.update({("/rag", sub): ["on", "off"] for sub in ("rewrite", "rerank", "filter")})
+
+# Профили ретривала для /legal. Юридический: шире выборка (top_k) + дедуп по статье, чтобы
+# в контекст попадали разные нормы. rewrite/rerank выключены намеренно — на локальной
+# reasoning-модели при малом окне они сжигают контекст на размышления (см. ARCHITECTURE.md).
+LEGAL_RETR = {"rewrite": False, "rerank": False, "filter": True, "top_k": 8, "dedup": True}
+BASE_RETR = {"rewrite": False, "rerank": False, "filter": False, "top_k": 3, "dedup": False}
+
+# Системный промпт юр-агента: guardrails, обязательные для юридического ассистента —
+# факты и опора на нормы, точные ссылки, без гарантий исхода и без замены живого юриста.
+LEGAL_SYSTEM = (
+    "Ты — юридический ассистент по праву РФ. Соблюдай правила:\n"
+    "1. Отвечай ТОЛЬКО на основе предоставленных фрагментов законодательства. Если их нет "
+    "или в них нет ответа — прямо скажи «Не знаю» и попроси уточнить. Не выдумывай нормы, "
+    "номера статей, даты и цитаты.\n"
+    "2. Ссылайся на конкретные статьи (например, «согласно ст. 80 ТК РФ») и цитируй точно.\n"
+    "3. Излагай факты и содержание нормы. Не давай оценок «выиграете/проиграете», не "
+    "прогнозируй и не гарантируй исход дела.\n"
+    "4. Не давай индивидуальных юридических советов и не заменяй консультацию юриста; при "
+    "реальном споре рекомендуй обратиться к квалифицированному специалисту.\n"
+    "5. Если норма могла измениться или вопрос выходит за пределы предоставленных документов "
+    "— предупреди об этом.\n"
+    "Пиши по-русски, кратко и по существу."
+)
 
 
 class SlashCompleter(Completer):
@@ -174,6 +203,26 @@ def warm_up_embeddings(client: OpenAI, embed_model: str) -> bool:
         return False
 
 
+def effective_context(params: GenParams, model: str, hw_limit: int) -> int:
+    """Рабочий лимит контекста: override пользователя (/param context_window) или размер,
+    сообщённый LM Studio. Управляет порогом автосжатия; в запрос к модели не отправляется."""
+    override = params.for_model(model).get("context_window")
+    return int(override) if override else hw_limit
+
+
+def safe_top_k(requested: int, context_limit: int) -> int:
+    """Страховка от обрыва ответа: на маленьком окне режем число чанков в промпте, чтобы
+    reasoning-модели осталось место на размышления (она тратит тысячи токенов до ответа;
+    иначе промпт+reasoning переполняют окно и ответ выходит пустым). Пороги эмпирические:
+    на ≤8k места хватает только на ~4 чанка, на 12-16k — на ~6, дальше — сколько просят.
+    Дедуп по статье компенсирует урезание (в 3-4 чанка попадают разные нормы)."""
+    if context_limit >= 16000:
+        return requested
+    if context_limit >= 12000:
+        return min(requested, 6)
+    return min(requested, 4)
+
+
 def stream_reply(client: OpenAI, model: str, messages: list[dict], gen_kwargs: dict):
     """Стримит ответ в stdout. Возвращает (текст | None, usage | None)."""
     kwargs = dict(model=model, messages=messages, stream=True, **gen_kwargs)
@@ -192,7 +241,8 @@ def stream_reply(client: OpenAI, model: str, messages: list[dict], gen_kwargs: d
                 print(text, end="", flush=True)
         print()
         if not parts:
-            print("[пустой ответ: если задан max_tokens, он мог целиком уйти на размышления модели]")
+            print("[пустой ответ: reasoning-модель израсходовала весь бюджет на размышления. "
+                  "Поднимите контекст модели в LM Studio, уменьшите top_k или снимите малый max_tokens]")
         return "".join(parts) or None, usage
     except KeyboardInterrupt:
         print("\n[генерация прервана]")
@@ -293,7 +343,7 @@ def handle_rag_command(arg: str, rag_index, rag_on: bool, retr: dict, client: Op
             print("Индекс пуст.")
         enh = ", ".join(f"{name}={'вкл' if retr[key] else 'выкл'}"
                         for key, name in RETR_LABELS.items())
-        print(f"Ретривал: {enh}")
+        print(f"Ретривал: {enh}, top_k={retr['top_k']}, дедуп по статье={'вкл' if retr['dedup'] else 'выкл'}")
     elif sub == "clear":
         rag_index.clear()
         rag_on = False
@@ -369,6 +419,43 @@ def handle_profile_command(arg: str, profile: Profile, model: str) -> None:
               "triggers <n> | hint <n> <вопрос> | mode smart|always|off")
 
 
+def handle_legal_command(arg: str, params: GenParams, model: str, retr: dict,
+                         rag_index, rag_on: bool, session: Session, default_system: str) -> bool:
+    """Зонтичный переключатель юр-режима: систем-промпт + генерация (preset legal) + ретривал.
+
+    Правит params, retr и session.system_prompt на месте; возвращает новое rag_on. Один
+    тумблер «до/после»: on — всё оптимизированное, off — базовый вариант модели.
+    """
+    arg = arg.strip().lower()
+    if arg not in ("on", "off"):
+        print("Использование: /legal on | off  (юр-режим: систем-промпт + параметры + ретривал)")
+        return rag_on
+    if arg == "on":
+        params.apply_preset(model, "legal")
+        retr.update(LEGAL_RETR)
+        session.system_prompt = LEGAL_SYSTEM
+        session.save()
+        if rag_index and rag_index.entries:
+            rag_on = True
+        print("Юридический режим ВКЛ:")
+        print("  систем-промпт — юр-агент (факты, ссылки на статьи, без гарантий исхода, не заменяет юриста)")
+        pk = ", ".join(f"{k}={v}" for k, v in PRESETS["legal"].items())
+        print(f"  генерация — preset legal ({pk})")
+        print(f"  ретривал  — top_k={retr['top_k']}, дедуп по статье, фильтр релевантности; "
+              f"rewrite/rerank выкл (жгут контекст на reasoning-модели)")
+        if not (rag_index and rag_index.entries):
+            print("  ⚠ RAG-индекс пуст — добавьте документ: /rag add <путь>")
+    else:
+        params.reset(model)
+        retr.update(BASE_RETR)
+        session.system_prompt = default_system
+        session.save()
+        print("Юридический режим ВЫКЛ (базовый вариант для сравнения «до/после»):")
+        print(f"  систем-промпт — сброшен к исходному{' (пустой)' if not default_system else ''}; "
+              f"генерация — дефолты модели; ретривал — top_k={retr['top_k']}, без дедупа и фильтра")
+    return rag_on
+
+
 def handle_param_command(arg: str, params: GenParams, model: str) -> None:
     name, _, value = arg.partition(" ")
     name, value = name.lower(), value.strip()
@@ -382,6 +469,23 @@ def handle_param_command(arg: str, params: GenParams, model: str) -> None:
     elif name == "reset":
         params.reset(model)
         print(f"Все параметры для {model} сброшены на дефолты модели.")
+    elif name == "preset":
+        if not value or value.lower() in ("list", "?"):
+            print("Пресеты параметров под задачу:")
+            for pname, pvals in PRESETS.items():
+                shown = ", ".join(f"{k}={v}" for k, v in pvals.items())
+                print(f"  {pname} — {shown}")
+            print("Применить: /param preset <имя>; снять (дефолты модели, для сравнения): /param preset off")
+        elif value.lower() in ("off", "выкл", "baseline", "-"):
+            params.reset(model)
+            print(f"Пресет снят: параметры {model} — дефолты модели (базовый вариант для сравнения «до/после»).")
+        else:
+            try:
+                applied = params.apply_preset(model, value.lower())
+                shown = ", ".join(f"{k}={v}" for k, v in applied.items())
+                print(f"Пресет «{value.lower()}» применён к {model}: {shown}")
+            except ValueError as e:
+                print(e)
     elif value.lower() in ("default", "дефолт", "-"):
         if params.unset(model, name):
             print(f"{name} сброшен на дефолт модели.")
@@ -407,18 +511,18 @@ def main() -> int:
 
     client = OpenAI(base_url=args.url, api_key="lm-studio")
 
-    context_limit = DEFAULT_CONTEXT
+    hw_context = DEFAULT_CONTEXT  # размер окна из LM Studio (задаётся при загрузке модели)
     if args.model:
         model = args.model
         infos = api_v0_models(args.url) or []
         info = next((m for m in infos if m["id"] == model), None)
         if info:
-            context_limit = info.get("loaded_context_length") or info.get("max_context_length") or DEFAULT_CONTEXT
+            hw_context = info.get("loaded_context_length") or info.get("max_context_length") or DEFAULT_CONTEXT
     else:
         chosen = choose_model(client, args.url)
         if not chosen:
             return 1
-        model, context_limit = chosen
+        model, hw_context = chosen
 
     session = Session(system_prompt=args.system, model=model)
     embed_model = find_embedding_model(args.url, client)
@@ -426,10 +530,12 @@ def main() -> int:
     params = GenParams()
     if args.temperature is not None:  # флаг действует только на эту сессию
         params.set(model, "temperature", str(args.temperature), persist=False)
+    # эффективный лимит: override /param context_window, иначе размер из LM Studio
+    context_limit = effective_context(params, model, hw_context)
     rag_index = None
     rag_on = False
-    # улучшения ретривала (работают только при включённом RAG)
-    retr = {"rewrite": True, "rerank": True, "filter": True}
+    # настройки ретривала (работают только при включённом RAG); top_k/dedup — под юр-режим
+    retr = {"rewrite": True, "rerank": True, "filter": True, "top_k": TOP_K, "dedup": False}
     debug = True   # строка статистики после каждого ответа
     tokens_used = 0  # ~размер последнего запроса по данным usage или оценке
 
@@ -492,7 +598,8 @@ def main() -> int:
             elif cmd == "/model":
                 chosen = choose_model(client, args.url)
                 if chosen:
-                    model, context_limit = chosen
+                    model, hw_context = chosen
+                    context_limit = effective_context(params, model, hw_context)
                     session.model = model
                     session.save()
                     print(f"Модель: {model} (контекст {context_limit}). История сохранена.")
@@ -521,11 +628,15 @@ def main() -> int:
                 else:
                     print(f"Сжимать нечего: в истории не больше {KEEP_MESSAGES} сообщений.")
             elif cmd == "/stats":
+                context_limit = effective_context(params, model, hw_context)
                 print_stats(session, tokens_used, context_limit, rag_index, rag_on, profile, params)
             elif cmd == "/rag":
                 rag_index, rag_on = handle_rag_command(arg, rag_index, rag_on, retr, client, args.url)
             elif cmd == "/profile":
                 handle_profile_command(arg, profile, model)
+            elif cmd == "/legal":
+                rag_on = handle_legal_command(arg, params, model, retr, rag_index, rag_on,
+                                              session, args.system)
             elif cmd == "/param":
                 handle_param_command(arg, params, model)
             elif cmd == "/debug":
@@ -534,6 +645,9 @@ def main() -> int:
             else:
                 print(f"Неизвестная команда: {cmd}. /help — список команд.")
             continue
+
+        # рабочий лимит контекста мог измениться через /param context_window
+        context_limit = effective_context(params, model, hw_context)
 
         # обычное сообщение: профиль + RAG -> запрос -> сохранение -> сжатие
         rag_context = ""
@@ -546,11 +660,18 @@ def main() -> int:
                     query = rewrite_query(client, model, session.messages, user_input)
                     if debug and query != user_input:
                         print(f"[rewrite: {query[:80]}]")
-                hits = rag_index.search(query, top_k=RERANK_CANDIDATES if retr["rerank"] else TOP_K)
+                # страховка: на маленьком окне режем top_k, чтобы reasoning-модели
+                # осталось место на размышления (иначе пустой ответ)
+                eff_top_k = safe_top_k(retr["top_k"], context_limit)
+                if debug and eff_top_k < retr["top_k"]:
+                    print(f"[страховка: top_k {retr['top_k']}→{eff_top_k} — окно {context_limit} "
+                          f"мало для reasoning-модели; для полного top_k поднимите контекст в LM Studio]")
+                fetch = RERANK_CANDIDATES if retr["rerank"] else eff_top_k
+                hits = rag_index.search(query, top_k=fetch, dedup=retr["dedup"])
                 best_score = hits[0]["score"] if hits else 0.0
                 if retr["filter"]:
                     hits = relevance_filter(hits)
-                hits = rerank(client, model, query, hits) if retr["rerank"] else hits[:TOP_K]
+                hits = rerank(client, model, query, hits) if retr["rerank"] else hits[:eff_top_k]
                 # порог уверенности: релевантного нет -> честно «не знаю», без вызова модели
                 if not hits or best_score < ANSWER_MIN_SCORE:
                     if debug:
@@ -594,8 +715,9 @@ def main() -> int:
         if rag_hits:
             print("\nИсточники:")
             for i, h in enumerate(rag_hits, 1):
-                print(f"  [{i}] {Path(h['source']).name} · {section_of(h['text'])} "
-                      f"· chunk {h['chunk_id']} · score {h['score']:.2f}")
+                # chunk_id и score — отладочные, показываем только в /debug
+                extra = f" · chunk {h['chunk_id']} · score {h['score']:.2f}" if debug else ""
+                print(f"  [{i}] {Path(h['source']).name} · {section_of(h['text'])}{extra}")
             print("Цитаты:")
             for i, h in enumerate(rag_hits, 1):
                 frag = " ".join(h["text"].split())[:220]

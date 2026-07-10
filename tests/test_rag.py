@@ -251,6 +251,19 @@ class TestRagIndexPipeline(unittest.TestCase):
         hits = idx.search("квантовая хромодинамика адронов", top_k=3, min_score=0.5)
         self.assertEqual(hits, [])
 
+    def test_dedup_keeps_one_chunk_per_article(self):
+        # два чанка одной статьи (дубли по норме) + другая статья
+        idx = self._index()
+        texts = ["Статья 5. отпуск отпуск первая часть",
+                 "Статья 5. отпуск вторая часть",
+                 "Статья 6. отпуск иная норма"]
+        idx.entries = [{"source": "x.txt", "text": t, "vector": _fake_vector(t)} for t in texts]
+        plain = [rag.section_of(h["text"]) for h in idx.search("отпуск", top_k=3, min_score=0.0)]
+        self.assertNotEqual(len(plain), len(set(plain)))  # без дедупа ст.5 занимает 2 слота
+        ded = [rag.section_of(h["text"]) for h in idx.search("отпуск", top_k=3, min_score=0.0, dedup=True)]
+        self.assertEqual(len(ded), len(set(ded)))         # все нормы разные
+        self.assertIn("Статья 6.", ded)                   # дедуп освободил слот другой статье
+
     def test_reindex_replaces_old_chunks(self):
         idx = self._index()
         idx.add_path(str(self.src))

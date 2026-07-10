@@ -13,7 +13,9 @@ INDEX_PATH = DATA_DIR / "rag_index.json"
 CHUNK_SIZE = 800        # символов в чанке
 CHUNK_OVERLAP = 200     # перекрытие соседних чанков
 EMBED_BATCH = 32        # чанков на один запрос к эмбеддингам
-TOP_K = 3               # сколько чанков подставлять в контекст
+TOP_K = 6               # сколько чанков подставлять в контекст. 6, а не 3: на юртекстах
+                        # bge-m3 даёт плоское распределение score (нужная статья часто
+                        # на 4-5 месте), при TOP_K=3 ключевая норма обрезалась — см. ARCHITECTURE.md
 MIN_SCORE = 0.45        # порог косинусной близости для попадания в выборку
 ANSWER_MIN_SCORE = 0.5  # ниже лучшего score — ассистент отвечает «не знаю»
 ARTICLE_MAX = 2000      # статья длиннее — дробим окном, сохраняя заголовок в каждом чанке
@@ -176,11 +178,16 @@ class RagIndex:
         self.save()
         return added_files, added_chunks
 
-    def search(self, query: str, top_k: int = TOP_K, min_score: float = MIN_SCORE) -> list[dict]:
-        """Топ-k чанков, похожих на запрос: [{source, text, score}], без вектора.
+    def search(self, query: str, top_k: int = TOP_K, min_score: float = MIN_SCORE,
+               dedup: bool = False) -> list[dict]:
+        """Топ-k чанков, похожих на запрос: [{source, text, score, chunk_id}], без вектора.
 
         Оценка близости (score) возвращается — на неё опираются фильтр
         релевантности и reranker. Пустой список, если ничего не нашлось.
+
+        dedup=True: оставляет только лучший чанк на статью (source + section_of), чтобы
+        одна норма не занимала несколько слотов и в топ попадало больше РАЗНЫХ статей —
+        под юркорпус, где длинная статья дробится на много чанков (см. ARCHITECTURE.md).
         """
         if not self.entries:
             return []
@@ -190,12 +197,21 @@ class RagIndex:
             key=lambda pair: pair[0],
             reverse=True,
         )
-        return [
-            {"source": self.entries[i]["source"], "text": self.entries[i]["text"],
-             "score": score, "chunk_id": i}
-            for score, i in scored[:top_k]
-            if score >= min_score
-        ]
+        hits: list[dict] = []
+        seen: set = set()
+        for score, i in scored:
+            if score < min_score:
+                break  # отсортировано по убыванию — дальше только хуже
+            if dedup:
+                key = (self.entries[i]["source"], section_of(self.entries[i]["text"]))
+                if key in seen:
+                    continue
+                seen.add(key)
+            hits.append({"source": self.entries[i]["source"], "text": self.entries[i]["text"],
+                         "score": score, "chunk_id": i})
+            if len(hits) >= top_k:
+                break
+        return hits
 
     def sources(self) -> dict[str, int]:
         """{путь файла: число чанков} для /rag status."""

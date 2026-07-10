@@ -18,6 +18,7 @@ PARAMS_PATH = DATA_DIR / "params.json"
 SPEC = {
     "temperature": (float, 0.0, 2.0, "случайность: 0 — детерминированно, выше — разнообразнее"),
     "max_tokens": (int, 1, None, "лимит длины ответа (у reasoning-моделей включает размышления!)"),
+    "context_window": (int, 512, None, "рабочий лимит контекста для порога автосжатия; в API не шлётся, default — брать размер из LM Studio"),
     "top_p": (float, 0.0, 1.0, "nucleus sampling: доля вероятностной массы"),
     "top_k": (int, 1, None, "выбор из k самых вероятных токенов"),
     "min_p": (float, 0.0, 1.0, "отсечка маловероятных токенов"),
@@ -29,6 +30,27 @@ SPEC = {
 
 # параметры OpenAI API — идут аргументами SDK; остальные (LM Studio) — через extra_body
 NATIVE = {"temperature", "max_tokens", "top_p", "presence_penalty", "frequency_penalty", "seed"}
+
+# клиентские параметры: влияют на поведение самого CLI (порог сжатия), в API НЕ отправляются
+CLIENT_SIDE = {"context_window"}
+
+# готовые наборы параметров под конкретную задачу. /param preset <имя> применяет разом,
+# /param preset off (= /param reset) снимает всё — возврат к дефолтам модели для сравнения «до/после».
+PRESETS = {
+    # локальный юридический агент: максимальная детерминированность и опора на источники,
+    # без «фантазии».
+    # max_tokens СПЕЦИАЛЬНО не задаём: локальная reasoning-модель (qwen3.5) тратит на
+    # размышления тысячи токенов до ответа (замерено ~5-7к), и любой маленький лимит
+    # обрезает её ПОСРЕДИ размышлений -> пустой ответ. Реальный предел длины задаёт
+    # контекстное окно (см. /param context_window и раздел про сжатие в ARCHITECTURE.md).
+    "legal": {
+        "temperature": 0.0,     # закон не терпит креатива: один вопрос -> один и тот же ответ
+        "top_p": 0.9,           # страховка, если у пресета модели temperature > 0
+        "top_k": 20,            # узкая выборка токенов -> меньше отсебятины
+        "min_p": 0.05,          # отсечь совсем маловероятные токены
+        "repeat_penalty": 1.1,  # мягкий штраф за повтор формулировок
+    },
+}
 
 
 class GenParams:
@@ -76,9 +98,20 @@ class GenParams:
         self.by_model.pop(model, None)
         self.save()
 
+    def apply_preset(self, model: str, name: str) -> dict:
+        """Применяет именованный пресет (замена ВСЕХ переопределений модели). Возвращает набор."""
+        if name not in PRESETS:
+            raise ValueError(f"Неизвестный пресет «{name}». Доступны: {', '.join(PRESETS)}")
+        self.by_model[model] = dict(PRESETS[name])
+        self.save()
+        return self.by_model[model]
+
     def request_kwargs(self, model: str) -> dict:
-        """kwargs для client.chat.completions.create: нативные + extra_body."""
-        current = self.for_model(model)
+        """kwargs для client.chat.completions.create: нативные + extra_body.
+
+        Клиентские параметры (CLIENT_SIDE, напр. context_window) в API не отправляются.
+        """
+        current = {k: v for k, v in self.for_model(model).items() if k not in CLIENT_SIDE}
         kwargs = {k: v for k, v in current.items() if k in NATIVE}
         extra = {k: v for k, v in current.items() if k not in NATIVE}
         if extra:

@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import threading
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -162,7 +163,11 @@ def make_handler(agent: Agent, embed_model: str):
                 with _inference_lock:
                     result = agent.answer(question)
             except (APIConnectionError, APIError) as e:
-                self._json(502, {"detail": f"Модель недоступна: {e}"})
+                self._json(502, {"detail": f"Модель временно недоступна, попробуйте ещё раз. ({type(e).__name__})"})
+                return
+            except Exception as e:  # любая иная ошибка -> graceful JSON, а не обрыв соединения
+                traceback.print_exc()
+                self._json(500, {"detail": f"Внутренняя ошибка сервиса ({type(e).__name__}). Попробуйте переформулировать вопрос."})
                 return
             self._json(200, result)
 

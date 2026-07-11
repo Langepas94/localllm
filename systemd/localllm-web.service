@@ -6,7 +6,7 @@ Wants=ollama.service
 [Service]
 Type=simple
 WorkingDirectory=/opt/localllm-web
-ExecStart=/opt/localllm-web/.venv/bin/python web.py --url http://127.0.0.1:11434/v1 --model qwen2.5:0.5b --embed-model nomic-embed-text --host 127.0.0.1 --port 8000
+ExecStart=/opt/localllm-web/.venv/bin/python web.py --url http://127.0.0.1:11434/v1 --model qwen2.5:1.5b --embed-model nomic-embed-text --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=5
 

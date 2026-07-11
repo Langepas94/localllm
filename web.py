@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -104,6 +105,10 @@ class Agent:
             model=self.model, messages=messages, **preset_kwargs(self.model, "legal")
         )
         answer = strip_think(resp.choices[0].message.content or "").strip()
+        # Иногда модель даёт содержательный ответ И приписывает «Недостаточно данных» —
+        # убираем спорную приписку, если ответ не сводится только к ней (детерминированно).
+        if "недостаточно данных" in answer.lower() and len(answer) > 70:
+            answer = re.sub(r"[^.!?]*недостаточно данных[^.!?]*[.!?]?", "", answer, flags=re.I).strip()
         sources = [
             {
                 "source": Path(h["source"]).name,

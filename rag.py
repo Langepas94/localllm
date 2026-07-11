@@ -387,6 +387,26 @@ def build_article_lead(entries: list[dict]) -> dict[str, str]:
     return lead
 
 
+def build_article_full(entries: list[dict], cap: int = 4000) -> dict[str, str]:
+    """{«Статья N.» -> полный текст статьи} — все её чанки, склеенные по порядку.
+
+    Для показа статьи целиком в источниках (пользователь хочет прочесть норму, а не
+    обрывок). У чанков-продолжений повторяется префикс «Статья N.» — убираем его.
+    """
+    parts: dict[str, list[str]] = {}
+    for e in entries:
+        art = section_of(e["text"])
+        if art:
+            parts.setdefault(art, []).append(" ".join(e["text"].split()))
+    full: dict[str, str] = {}
+    for art, texts in parts.items():
+        acc = [texts[0]]
+        for t in texts[1:]:
+            acc.append(t[len(art):].strip() if t.startswith(art) else t)
+        full[art] = " ".join(acc)[:cap]
+    return full
+
+
 def special_case_reorder(query: str, hits: list[dict], catmap: dict[str, set[int]]) -> list[dict]:
     """Ставит общую норму выше специальных, если вопрос не про особую категорию.
 

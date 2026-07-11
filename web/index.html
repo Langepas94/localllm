@@ -26,8 +26,11 @@
   .sources { margin-top:10px; padding-top:10px; border-top:1px dashed var(--border); font-size:13px; }
   .sources h4 { margin:0 0 6px; color:var(--accent); font-size:12px; text-transform:uppercase; letter-spacing:.5px; }
   .src-item { margin-bottom:8px; }
-  .src-item .sec { color:var(--accent); font-weight:600; }
+  .src-item .sec { color:var(--accent); font-weight:600; cursor:pointer; user-select:none; display:inline-block; }
+  .src-item .sec:hover { text-decoration:underline; }
   .src-item .quote { color:var(--muted); font-style:italic; display:block; margin-top:2px; }
+  .src-full { color:var(--text); margin-top:4px; padding:9px 11px; background:var(--panel2);
+    border-radius:8px; max-height:260px; overflow-y:auto; line-height:1.55; white-space:pre-wrap; }
   .hint { color:var(--muted); font-size:14px; text-align:center; margin-top:40px; line-height:1.6; }
   .hint code { background:var(--panel2); padding:2px 7px; border-radius:6px; cursor:pointer; color:var(--accent); }
   footer { padding:14px 20px; border-top:1px solid var(--border); background:var(--panel); }
@@ -88,10 +91,12 @@
     let html = esc(data.answer || '');
     const srcs = data.sources || [];
     if (srcs.length){
-      html += '<div class="sources"><h4>Источники</h4>';
+      html += '<div class="sources"><h4>Источники <span style="color:var(--muted);text-transform:none;font-weight:400">(нажмите статью, чтобы прочитать целиком)</span></h4>';
       srcs.forEach(s => {
-        html += '<div class="src-item"><span class="sec">📄 ' + esc(s.section || s.source || '') + '</span>';
+        const title = esc(s.section || s.source || '');
+        html += '<div class="src-item"><span class="sec">▸ 📄 ' + title + '</span>';
         if (s.quote) html += '<span class="quote">' + esc(s.quote) + '…</span>';
+        if (s.full) html += '<div class="src-full" hidden>' + esc(s.full) + '</div>';
         html += '</div>';
       });
       html += '</div>';
@@ -128,7 +133,17 @@
   send.addEventListener('click', ask);
   q.addEventListener('keydown', e => { if (e.key==='Enter' && !e.shiftKey){ e.preventDefault(); ask(); } });
   document.addEventListener('click', e => {
-    if (e.target.classList.contains('example')){ q.value=e.target.textContent; q.focus(); }
+    if (e.target.classList.contains('example')){ q.value=e.target.textContent; q.focus(); return; }
+    const sec = e.target.closest('.sec');
+    if (sec){
+      const item = sec.closest('.src-item');
+      const full = item.querySelector('.src-full');
+      const quote = item.querySelector('.quote');
+      if (!full) return;
+      const opening = full.hasAttribute('hidden');
+      if (opening){ full.removeAttribute('hidden'); if(quote) quote.setAttribute('hidden',''); sec.textContent = sec.textContent.replace('▸','▾'); }
+      else { full.setAttribute('hidden',''); if(quote) quote.removeAttribute('hidden'); sec.textContent = sec.textContent.replace('▾','▸'); }
+    }
   });
 </script>
 </body>

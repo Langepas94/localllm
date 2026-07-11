@@ -31,8 +31,8 @@ from bench import strip_think, preset_kwargs
 from chat import LEGAL_SYSTEM, LEGAL_RETR
 from rag import (
     ANSWER_MIN_SCORE, RERANK_CANDIDATES, RagIndex,
-    build_article_lead, build_category_map, relevance_filter, section_of,
-    special_case_reorder,
+    build_article_full, build_article_lead, build_category_map, relevance_filter,
+    section_of, special_case_reorder,
 )
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
@@ -52,9 +52,10 @@ class Agent:
         self.client = client
         self.model = model
         self.index = index
-        # Карты строятся один раз при старте: категории для reorder и лид-чанки статей.
+        # Карты строятся один раз при старте: категории, лид-чанки и полный текст статей.
         self.catmap = build_category_map(index.entries)
         self.lead = build_article_lead(index.entries)
+        self.full = build_article_full(index.entries)
 
     def answer(self, question: str) -> dict:
         # Пайплайн как в chat.py (legal): поиск+дедуп -> фильтр -> rerank -> порог «не знаю».
@@ -87,13 +88,16 @@ class Agent:
             for i, h in enumerate(ctx_hits, 1)
         )
         context = (
-            "Ответь на вопрос пользователя, опираясь ТОЛЬКО на фрагменты ниже. Фрагмент [1] "
-            "— самый релевантный, отвечай прежде всего по нему. Требования к ответу:\n"
-            "- ОДИН короткий абзац, 2–4 предложения, своими словами;\n"
-            "- строго по сути вопроса; фрагменты не по теме ИГНОРИРУЙ, не тяни их в ответ;\n"
-            "- не перечисляй статьи списком, не копируй «[1]» и заголовки статей;\n"
-            "- сошлись на номер статьи, из которой взял норму;\n"
-            "- если прямого ответа в фрагментах нет — напиши «Не знаю» и попроси уточнить.\n\n"
+            "Ты отвечаешь работнику простым языком. Опирайся ТОЛЬКО на фрагменты ниже; "
+            "фрагмент [1] — самый релевантный. Требования к ответу:\n"
+            "- 2–4 предложения своими словами: сначала суть нормы, затем что это значит "
+            "для работника на практике;\n"
+            "- строго по теме вопроса; фрагменты не по теме ИГНОРИРУЙ, не тяни их в ответ;\n"
+            "- сошлись на номер статьи, из которой взял норму (пиши «ст. N ТК РФ»);\n"
+            "- не перечисляй статьи списком, не копируй «[1]» и заголовки;\n"
+            "- НЕ пиши «не знаю», если ответ в фрагментах есть — отвечай уверенно;\n"
+            "- ТОЛЬКО если по теме вопроса в фрагментах реально нет нормы — ответь одной "
+            "фразой «Недостаточно данных, уточните вопрос» и БОЛЬШЕ ничего не добавляй.\n\n"
             + chunks
         )
         messages = [
@@ -109,6 +113,7 @@ class Agent:
                 "source": Path(h["source"]).name,
                 "section": section_of(h["text"]),
                 "quote": " ".join(self.lead.get(section_of(h["text"]), h["text"]).split())[:220],
+                "full": self.full.get(section_of(h["text"]), " ".join(h["text"].split())),
             }
             for h in ctx_hits
         ]

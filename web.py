@@ -31,13 +31,13 @@ from bench import strip_think, preset_kwargs
 from chat import LEGAL_SYSTEM, LEGAL_RETR
 from rag import (
     ANSWER_MIN_SCORE, RERANK_CANDIDATES, RagIndex,
-    build_article_lead, build_category_map, relevance_filter, rerank, section_of,
+    build_article_lead, build_category_map, relevance_filter, section_of,
     special_case_reorder,
 )
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 MAX_QUESTION_CHARS = 1000
-CONTEXT_ARTICLES = 5      # статей в контексте: меньше шума -> слабая модель точнее
+CONTEXT_ARTICLES = 3      # статей в контексте: меньше шума -> слабая модель точнее и короче
 CONTEXT_CHARS = 1100      # символов на статью (ключевая норма — в начале статьи)
 
 # Одна тяжёлая генерация за раз: на слабом VPS (2 ядра, обе модели в swap)
@@ -63,13 +63,11 @@ class Agent:
         best_score = hits[0]["score"] if hits else 0.0
         if LEGAL_RETR["filter"]:
             hits = relevance_filter(hits)
-        if LEGAL_RETR["rerank"]:
-            hits = rerank(self.client, self.model, question, hits, top_k=LEGAL_RETR["top_k"])
-        else:
-            hits = hits[: LEGAL_RETR["top_k"]]
-        # Детерминированно ставим общую норму выше специальных (или норму нужной
-        # категории — если вопрос про неё). Слабая модель отвечает по первому фрагменту.
-        hits = special_case_reorder(question, hits, self.catmap)
+        # LLM-переранжирование убрано: на слабом железе это лишний вызов чат-модели (сильно
+        # медленнее) и он ненадёжен. Порядок задаёт косинус + детерминированный
+        # special_case_reorder (общая норма выше специальных; норма категории — если вопрос
+        # про неё). Слабая модель отвечает прежде всего по первому фрагменту.
+        hits = special_case_reorder(question, hits, self.catmap)[: LEGAL_RETR["top_k"]]
 
         # grounding: если ничего релевантного — детерминированное «Не знаю», без вызова модели
         if not hits or best_score < ANSWER_MIN_SCORE:
@@ -89,12 +87,14 @@ class Agent:
             for i, h in enumerate(ctx_hits, 1)
         )
         context = (
-            "Отвечай, опираясь ТОЛЬКО на пронумерованные фрагменты ниже. Фрагмент [1] — "
-            "наиболее релевантная норма, отвечай прежде всего по нему. Дай связный ответ "
-            "СВОИМИ словами: не копируй номера фрагментов вроде «[1]» и не начинай ответ с "
-            "заголовка статьи. Отвечай КРАТКО — 1–3 предложения, только суть и ссылку на "
-            "статью, без длинных перечислений. Если в фрагментах нет ответа — напиши «Не "
-            "знаю» и попроси уточнить, ничего не выдумывай.\n\n" + chunks
+            "Ответь на вопрос пользователя, опираясь ТОЛЬКО на фрагменты ниже. Фрагмент [1] "
+            "— самый релевантный, отвечай прежде всего по нему. Требования к ответу:\n"
+            "- ОДИН короткий абзац, 2–4 предложения, своими словами;\n"
+            "- строго по сути вопроса; фрагменты не по теме ИГНОРИРУЙ, не тяни их в ответ;\n"
+            "- не перечисляй статьи списком, не копируй «[1]» и заголовки статей;\n"
+            "- сошлись на номер статьи, из которой взял норму;\n"
+            "- если прямого ответа в фрагментах нет — напиши «Не знаю» и попроси уточнить.\n\n"
+            + chunks
         )
         messages = [
             {"role": "system", "content": LEGAL_SYSTEM},

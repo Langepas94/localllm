@@ -32,8 +32,7 @@ from bench import strip_think, preset_kwargs
 from chat import LEGAL_SYSTEM, LEGAL_RETR
 from rag import (
     ANSWER_MIN_SCORE, RERANK_CANDIDATES, RagIndex,
-    build_article_full, build_article_lead, build_category_map, relevance_filter,
-    section_of, special_case_reorder,
+    build_article_full, build_article_lead, relevance_filter, section_of,
 )
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
@@ -55,8 +54,7 @@ class Agent:
         self.client = client
         self.model = model
         self.index = index
-        # Карты строятся один раз при старте: категории, лид-чанки и полный текст статей.
-        self.catmap = build_category_map(index.entries)
+        # Строятся один раз при старте: лид-чанки и полный текст статей (для источников).
         self.lead = build_article_lead(index.entries)
         self.full = build_article_full(index.entries)
 
@@ -67,11 +65,12 @@ class Agent:
         best_score = hits[0]["score"] if hits else 0.0
         if LEGAL_RETR["filter"]:
             hits = relevance_filter(hits)
-        # LLM-переранжирование убрано: на слабом железе это лишний вызов чат-модели (сильно
-        # медленнее) и он ненадёжен. Порядок задаёт косинус + детерминированный
-        # special_case_reorder (общая норма выше специальных; норма категории — если вопрос
-        # про неё). Слабая модель отвечает прежде всего по первому фрагменту.
-        hits = special_case_reorder(question, hits, self.catmap)[: LEGAL_RETR["top_k"]]
+        # Порядок — чистый косинус (+dedup по статье). Он и так ставит нужную общую норму
+        # первой (проверено: увольнение->ст.80, испыт.срок->ст.70, отпуск за свой счёт->ст.128).
+        # LLM-rerank убран (медленно/ненадёжно); special_case_reorder убран — он ошибочно
+        # топил общие статьи, чей текст перечисляет категории работников (ст.70 не попадала
+        # в контекст, отсюда ложные «недостаточно данных»).
+        hits = hits[: LEGAL_RETR["top_k"]]
 
         # grounding: если ничего релевантного — детерминированное «Не знаю», без вызова модели
         if not hits or best_score < ANSWER_MIN_SCORE:

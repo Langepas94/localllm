@@ -104,6 +104,32 @@ CLI следит за заполнением контекстного окна (
 
 `python bench.py --model <id> --rag` гоняет набор юр-вопросов в двух режимах — базовом и оптимизированном (пресет `legal` + промпт + RAG) — и сводит время, токены, ток/с, а также сохраняет сами ответы для сравнения качества (markdown + JSON в `docs/`). `--isolate` — варьировать только параметры, `--repeat N` — проверка детерминизма. Тем же бенчмарком сравнивают кванты модели (прогнать на разных GGUF). Подробно — в [docs/DAY29-optimization.md](docs/DAY29-optimization.md).
 
+## Веб-сервис (VPS)
+
+Тот же агент, что и в CLI, доступен по HTTP — `web.py` (отдельная точка входа, но
+пайплайн переиспользует `rag.py` и юр-режим из `chat.py`, так что локально и на сервере
+**одна программа**). На чистом stdlib (`http.server`), без веб-фреймворков.
+
+```powershell
+python scripts/build_index.py --url http://127.0.0.1:11434/v1 --embed-model bge-m3  # собрать индекс из corpus/
+python web.py --url http://127.0.0.1:11434/v1 --model qwen2.5:1.5b --embed-model bge-m3
+```
+
+Работает против любого OpenAI-совместимого API: LM Studio (`/v1`) или **Ollama**
+(`http://127.0.0.1:11434/v1`). Эндпоинты: `GET /` — страница чата (`web/index.html`),
+`POST /api/chat` — `{answer, sources[], not_known}`, `GET /api/health`.
+
+Развёрнут на VPS: **http://5.129.234.9/**. Деплой — ровно из git (`git ls-files`),
+сервер стирается и собирается заново, никаких ручных правок на сервере:
+
+```powershell
+git add -A; git commit -m "..."; ./scripts/deploy.ps1
+```
+
+Скрипт пакует git-файлы → заливает → пересобирает venv → строит индекс ТК РФ (если нет)
+→ ставит systemd (`localllm-web.service`) и nginx из git → рестарт → smoke-тест.
+Корпус: `corpus/tk-rf.pdf` (ТК РФ). Индекс (`data/rag_index.json`) — артефакт, в git не хранится.
+
 ## Документация
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — устройство кода, поток выполнения, как расширять.

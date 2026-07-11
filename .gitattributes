@@ -1,0 +1,4 @@
+# Файлы едут на Linux (systemd, nginx, python, bash) — держим LF, иначе CRLF ломает
+# исполнение на сервере. Деплой пакует рабочую копию, поэтому важно и в working copy.
+* text=auto eol=lf
+*.pdf binary

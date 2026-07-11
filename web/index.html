@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Агент по трудовому праву</title>
+<style>
+  :root {
+    --bg:#0f172a; --panel:#1e293b; --panel2:#273449; --text:#e2e8f0; --muted:#94a3b8;
+    --accent:#38bdf8; --accent2:#0ea5e9; --user:#1d4ed8; --border:#334155;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    background:var(--bg); color:var(--text); height:100vh; display:flex; flex-direction:column; }
+  header { padding:18px 20px; background:linear-gradient(135deg,#0c4a6e,#1e293b); border-bottom:1px solid var(--border); }
+  header h1 { margin:0 0 4px; font-size:20px; }
+  header p { margin:0; color:var(--muted); font-size:13px; line-height:1.5; }
+  header .badge { color:var(--accent); font-weight:600; }
+  main { flex:1; overflow-y:auto; padding:20px; max-width:820px; width:100%; margin:0 auto; }
+  .msg { margin-bottom:16px; display:flex; }
+  .msg .bubble { padding:12px 15px; border-radius:14px; line-height:1.55; font-size:15px;
+    white-space:pre-wrap; word-wrap:break-word; max-width:85%; }
+  .msg.user { justify-content:flex-end; }
+  .msg.user .bubble { background:var(--user); color:#fff; border-bottom-right-radius:4px; }
+  .msg.bot .bubble { background:var(--panel); border:1px solid var(--border); border-bottom-left-radius:4px; }
+  .sources { margin-top:10px; padding-top:10px; border-top:1px dashed var(--border); font-size:13px; }
+  .sources h4 { margin:0 0 6px; color:var(--accent); font-size:12px; text-transform:uppercase; letter-spacing:.5px; }
+  .src-item { margin-bottom:8px; }
+  .src-item .sec { color:var(--accent); font-weight:600; }
+  .src-item .quote { color:var(--muted); font-style:italic; display:block; margin-top:2px; }
+  .hint { color:var(--muted); font-size:14px; text-align:center; margin-top:40px; line-height:1.6; }
+  .hint code { background:var(--panel2); padding:2px 7px; border-radius:6px; cursor:pointer; color:var(--accent); }
+  footer { padding:14px 20px; border-top:1px solid var(--border); background:var(--panel); }
+  .inputbar { max-width:820px; margin:0 auto; display:flex; gap:10px; }
+  #q { flex:1; resize:none; padding:12px 14px; border-radius:12px; border:1px solid var(--border);
+    background:var(--bg); color:var(--text); font-size:15px; font-family:inherit; height:48px; }
+  #q:focus { outline:none; border-color:var(--accent); }
+  #send { padding:0 22px; border:0; border-radius:12px; background:var(--accent2); color:#fff; font-size:15px; font-weight:600; cursor:pointer; }
+  #send:disabled { opacity:.5; cursor:default; }
+  .disclaimer { max-width:820px; margin:8px auto 0; color:var(--muted); font-size:11px; text-align:center; }
+  .typing span { animation:blink 1.2s infinite; }
+  .typing span:nth-child(2){ animation-delay:.2s } .typing span:nth-child(3){ animation-delay:.4s }
+  @keyframes blink { 0%,100%{opacity:.2} 50%{opacity:1} }
+</style>
+</head>
+<body>
+  <header>
+    <h1>⚖️ Агент по трудовому праву</h1>
+    <p>Это <span class="badge">приватный ИИ-ассистент</span>, отвечающий на вопросы по
+       <b>Трудовому кодексу РФ</b>. Работает на локальной языковой модели с поиском по тексту
+       кодекса (RAG) — ваши вопросы не покидают сервер.</p>
+  </header>
+
+  <main id="chat">
+    <div class="hint" id="hint">
+      Задайте вопрос по трудовому праву. Например:<br><br>
+      <code class="example">Какова максимальная продолжительность рабочей недели?</code><br><br>
+      <code class="example">За сколько дней предупреждают об увольнении по собственному желанию?</code><br><br>
+      <code class="example">Сколько длится ежегодный оплачиваемый отпуск?</code>
+    </div>
+  </main>
+
+  <footer>
+    <div class="inputbar">
+      <textarea id="q" placeholder="Ваш вопрос по трудовому праву…" rows="1"></textarea>
+      <button id="send">Спросить</button>
+    </div>
+    <div class="disclaimer">
+      Справочная информация на основе ТК РФ, не является индивидуальной юридической консультацией.
+    </div>
+  </footer>
+
+<script>
+  const chat = document.getElementById('chat');
+  const q = document.getElementById('q');
+  const send = document.getElementById('send');
+  const hint = document.getElementById('hint');
+
+  function esc(s){ const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+
+  function addMsg(html, who){
+    const m=document.createElement('div'); m.className='msg '+who;
+    const b=document.createElement('div'); b.className='bubble'; b.innerHTML=html;
+    m.appendChild(b); chat.appendChild(m); chat.scrollTop=chat.scrollHeight; return b;
+  }
+
+  function renderAnswer(bubble, data){
+    let html = esc(data.answer || '');
+    const srcs = data.sources || [];
+    if (srcs.length){
+      html += '<div class="sources"><h4>Источники</h4>';
+      srcs.forEach(s => {
+        html += '<div class="src-item"><span class="sec">📄 ' + esc(s.section || s.source || '') + '</span>';
+        if (s.quote) html += '<span class="quote">' + esc(s.quote) + '…</span>';
+        html += '</div>';
+      });
+      html += '</div>';
+    }
+    bubble.innerHTML = html;
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  async function ask(){
+    const text = q.value.trim();
+    if (!text) return;
+    if (hint) hint.remove();
+    addMsg(esc(text), 'user');
+    q.value=''; send.disabled=true; q.disabled=true;
+    const bot = addMsg('<span class="typing">Ищу в кодексе<span>.</span><span>.</span><span>.</span></span>', 'bot');
+    try {
+      const r = await fetch('/api/chat', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ message: text })
+      });
+      if (!r.ok){
+        const e = await r.json().catch(()=>({detail:'Ошибка сервера'}));
+        bot.innerHTML = '⚠️ ' + esc(e.detail || ('HTTP '+r.status));
+      } else {
+        renderAnswer(bot, await r.json());
+      }
+    } catch(err){
+      bot.innerHTML = '⚠️ Не удалось связаться с сервисом. ' + esc(String(err));
+    } finally {
+      send.disabled=false; q.disabled=false; q.focus();
+    }
+  }
+
+  send.addEventListener('click', ask);
+  q.addEventListener('keydown', e => { if (e.key==='Enter' && !e.shiftKey){ e.preventDefault(); ask(); } });
+  document.addEventListener('click', e => {
+    if (e.target.classList.contains('example')){ q.value=e.target.textContent; q.focus(); }
+  });
+</script>
+</body>
+</html>

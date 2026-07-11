@@ -30,11 +30,14 @@ from bench import strip_think, preset_kwargs
 from chat import LEGAL_SYSTEM, LEGAL_RETR
 from rag import (
     ANSWER_MIN_SCORE, RERANK_CANDIDATES, RagIndex,
-    build_category_map, relevance_filter, rerank, section_of, special_case_reorder,
+    build_article_lead, build_category_map, relevance_filter, rerank, section_of,
+    special_case_reorder,
 )
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 MAX_QUESTION_CHARS = 1000
+CONTEXT_ARTICLES = 5      # статей в контексте: меньше шума -> слабая модель точнее
+CONTEXT_CHARS = 1100      # символов на статью (ключевая норма — в начале статьи)
 
 # Одна тяжёлая генерация за раз: на слабом VPS (2 ядра, обе модели в swap)
 # параллельный инференс лишь усиливает трешинг. Остальные запросы ждут -> стабильность.
@@ -48,8 +51,9 @@ class Agent:
         self.client = client
         self.model = model
         self.index = index
-        # Карта «статья -> спец-категории» для special_case_reorder (строится один раз).
+        # Карты строятся один раз при старте: категории для reorder и лид-чанки статей.
         self.catmap = build_category_map(index.entries)
+        self.lead = build_article_lead(index.entries)
 
     def answer(self, question: str) -> dict:
         # Пайплайн как в chat.py (legal): поиск+дедуп -> фильтр -> rerank -> порог «не знаю».
@@ -75,11 +79,18 @@ class Agent:
                 "not_known": True,
             }
 
-        chunks = "\n---\n".join(f"[{i}] {h['text']}" for i, h in enumerate(hits, 1))
+        # В контекст берём ЛИД-чанк статьи (заголовок + основная норма), а не тот, что
+        # вытащил дедуп по косинусу (может быть обрывок с поправками без сути). Топ-N
+        # статей после reorder — общая/нужная норма стоит первой.
+        ctx_hits = hits[:CONTEXT_ARTICLES]
+        chunks = "\n---\n".join(
+            f"[{i}] " + " ".join(self.lead.get(section_of(h["text"]), h["text"]).split())[:CONTEXT_CHARS]
+            for i, h in enumerate(ctx_hits, 1)
+        )
         context = (
-            "Отвечай, опираясь ТОЛЬКО на пронумерованные фрагменты ниже. Если в них "
-            "нет ответа — напиши «Не знаю» и попроси уточнить, ничего не выдумывай.\n\n"
-            + chunks
+            "Отвечай, опираясь ТОЛЬКО на пронумерованные фрагменты ниже. Фрагмент [1] — "
+            "наиболее релевантная норма. Если в фрагментах нет ответа — напиши «Не знаю» и "
+            "попроси уточнить, ничего не выдумывай.\n\n" + chunks
         )
         messages = [
             {"role": "system", "content": LEGAL_SYSTEM},
@@ -93,9 +104,9 @@ class Agent:
             {
                 "source": Path(h["source"]).name,
                 "section": section_of(h["text"]),
-                "quote": " ".join(h["text"].split())[:220],
+                "quote": " ".join(self.lead.get(section_of(h["text"]), h["text"]).split())[:220],
             }
-            for h in hits
+            for h in ctx_hits
         ]
         return {"answer": answer or "[пустой ответ]", "sources": sources, "not_known": False}
 

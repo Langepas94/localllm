@@ -370,6 +370,23 @@ def build_category_map(entries: list[dict]) -> dict[str, set[int]]:
     return cats
 
 
+def build_article_lead(entries: list[dict]) -> dict[str, str]:
+    """{«Статья N.» -> текст ЛИД-чанка} — первый чанк статьи в порядке документа.
+
+    Лид-чанк содержит заголовок статьи и её основную норму (в юркорпусе ключевое правило
+    стоит в начале статьи). Дедуп в search() оставляет чанк с наибольшим косинусом, а это
+    нередко обрывок с поправками («Статья 80. N 90-ФЗ, ...») без сути; для генерации ответа
+    подставляем именно лид-чанк, где норма есть. entries идут в порядке документа (add_path
+    читает последовательно), поэтому первый встреченный чанк статьи — лид.
+    """
+    lead: dict[str, str] = {}
+    for e in entries:
+        art = section_of(e["text"])
+        if art and art not in lead:
+            lead[art] = e["text"]
+    return lead
+
+
 def special_case_reorder(query: str, hits: list[dict], catmap: dict[str, set[int]]) -> list[dict]:
     """Ставит общую норму выше специальных, если вопрос не про особую категорию.
 

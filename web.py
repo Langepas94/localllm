@@ -30,7 +30,7 @@ from bench import strip_think, preset_kwargs
 from chat import LEGAL_SYSTEM, LEGAL_RETR
 from rag import (
     ANSWER_MIN_SCORE, RERANK_CANDIDATES, RagIndex,
-    relevance_filter, rerank, section_of,
+    build_category_map, relevance_filter, rerank, section_of, special_case_reorder,
 )
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
@@ -48,6 +48,8 @@ class Agent:
         self.client = client
         self.model = model
         self.index = index
+        # Карта «статья -> спец-категории» для special_case_reorder (строится один раз).
+        self.catmap = build_category_map(index.entries)
 
     def answer(self, question: str) -> dict:
         # Пайплайн как в chat.py (legal): поиск+дедуп -> фильтр -> rerank -> порог «не знаю».
@@ -60,6 +62,9 @@ class Agent:
             hits = rerank(self.client, self.model, question, hits, top_k=LEGAL_RETR["top_k"])
         else:
             hits = hits[: LEGAL_RETR["top_k"]]
+        # Детерминированно ставим общую норму выше специальных (или норму нужной
+        # категории — если вопрос про неё). Слабая модель отвечает по первому фрагменту.
+        hits = special_case_reorder(question, hits, self.catmap)
 
         # grounding: если ничего релевантного — детерминированное «Не знаю», без вызова модели
         if not hits or best_score < ANSWER_MIN_SCORE:

@@ -159,9 +159,16 @@ def make_handler(agent: Agent, embed_model: str):
             if len(question) > MAX_QUESTION_CHARS:
                 self._json(413, {"detail": f"Вопрос длиннее {MAX_QUESTION_CHARS} символов."})
                 return
+            # Слабый box тянет одну генерацию за раз (~100с). Не держим ждущие соединения
+            # открытыми (они отваливаются под нагрузкой) — если сервис занят, сразу отвечаем
+            # 503 «занято». Так сервис остаётся стабильным при нескольких запросах.
+            if not _inference_lock.acquire(blocking=False):
+                self._json(503, {"detail": "Сервис сейчас отвечает на другой вопрос "
+                                           "(на слабом сервере — по одному за раз). "
+                                           "Попробуйте через минуту."})
+                return
             try:
-                with _inference_lock:
-                    result = agent.answer(question)
+                result = agent.answer(question)
             except (APIConnectionError, APIError) as e:
                 self._json(502, {"detail": f"Модель временно недоступна, попробуйте ещё раз. ({type(e).__name__})"})
                 return
@@ -169,6 +176,8 @@ def make_handler(agent: Agent, embed_model: str):
                 traceback.print_exc()
                 self._json(500, {"detail": f"Внутренняя ошибка сервиса ({type(e).__name__}). Попробуйте переформулировать вопрос."})
                 return
+            finally:
+                _inference_lock.release()
             self._json(200, result)
 
     return Handler

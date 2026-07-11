@@ -82,11 +82,12 @@ THIRD_LEVEL.update({("/param", name): ["default"] for name in SPEC})
 THIRD_LEVEL[("/param", "preset")] = list(PRESETS) + ["off"]
 THIRD_LEVEL.update({("/rag", sub): ["on", "off"] for sub in ("rewrite", "rerank", "filter")})
 
-# Профили ретривала для /legal. Юридический: шире выборка (top_k) + дедуп по статье, чтобы
-# в контекст попадали разные нормы. rewrite/rerank выключены намеренно — на локальной
-# reasoning-модели при малом окне они сжигают контекст на размышления (см. ARCHITECTURE.md).
-LEGAL_RETR = {"rewrite": False, "rerank": False, "filter": True, "top_k": 8, "dedup": True}
-BASE_RETR = {"rewrite": False, "rerank": False, "filter": False, "top_k": 3, "dedup": False}
+# Профили ретривала для /legal. Два чётких режима, RAG включён в обоих:
+#   ВКЛ  — ВСЕ оптимизации (rewrite follow-up'ов, rerank, фильтр, дедуп, широкий top_k, grounding-инструкция);
+#   ВЫКЛ — голый RAG без единой оптимизации (просто чанки + вопрос, без инструкций и порога «не знаю»).
+# grounding=True добавляет в контекст указание «отвечай только по фрагментам» + порог ANSWER_MIN_SCORE.
+LEGAL_RETR = {"rewrite": True, "rerank": True, "filter": True, "top_k": 8, "dedup": True, "grounding": True}
+BASE_RETR = {"rewrite": False, "rerank": False, "filter": False, "top_k": 3, "dedup": False, "grounding": False}
 
 # Системный промпт юр-агента: guardrails, обязательные для юридического ассистента —
 # факты и опора на нормы, точные ссылки, без гарантий исхода и без замены живого юриста.
@@ -231,18 +232,30 @@ def stream_reply(client: OpenAI, model: str, messages: list[dict], gen_kwargs: d
             stream = client.chat.completions.create(**kwargs, stream_options={"include_usage": True})
         except BadRequestError:  # старый LM Studio без include_usage
             stream = client.chat.completions.create(**kwargs)
-        parts, usage = [], None
+        parts, usage, finish, reasoned = [], None, None, False
         for chunk in stream:
             if getattr(chunk, "usage", None):
                 usage = chunk.usage
-            if chunk.choices and chunk.choices[0].delta.content:
-                text = chunk.choices[0].delta.content
-                parts.append(text)
-                print(text, end="", flush=True)
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            if choice.finish_reason:
+                finish = choice.finish_reason
+            if getattr(choice.delta, "reasoning_content", None):
+                reasoned = True  # модель «думала» (reasoning уходит в отдельное поле)
+            if choice.delta.content:
+                parts.append(choice.delta.content)
+                print(choice.delta.content, end="", flush=True)
         print()
         if not parts:
-            print("[пустой ответ: reasoning-модель израсходовала весь бюджет на размышления. "
-                  "Поднимите контекст модели в LM Studio, уменьшите top_k или снимите малый max_tokens]")
+            # различаем обрыв по окну (finish=length) и просто пустой ответ
+            if finish == "length" or reasoned:
+                print("[ответ не поместился в контекстное окно: reasoning-модель израсходовала его "
+                      "на размышления (их у неё нельзя отключить). Поднимите loaded_context_length "
+                      "модели в LM Studio (сейчас окно мало) — это надёжный фикс; либо /legal on "
+                      "(temperature 0 даёт короткие стабильные размышления, чаще умещается)]")
+            else:
+                print("[пустой ответ от модели]")
         return "".join(parts) or None, usage
     except KeyboardInterrupt:
         print("\n[генерация прервана]")
@@ -251,7 +264,13 @@ def stream_reply(client: OpenAI, model: str, messages: list[dict], gen_kwargs: d
         print("\nПотеряно соединение с LM Studio.")
         return None, None
     except APIError as e:
-        print(f"\nОшибка API: {e}")
+        # частый случай на reasoning-модели с малым окном: размышления переполняют контекст
+        if "context" in str(e).lower():
+            print("\n[переполнено контекстное окно: reasoning-модель не уместила размышления + ответ. "
+                  "Поднимите loaded_context_length модели в LM Studio (сейчас окно мало) — надёжный фикс; "
+                  "либо /legal on: temperature 0 даёт короткие стабильные размышления]")
+        else:
+            print(f"\nОшибка API: {e}")
         return None, None
 
 
@@ -343,7 +362,8 @@ def handle_rag_command(arg: str, rag_index, rag_on: bool, retr: dict, client: Op
             print("Индекс пуст.")
         enh = ", ".join(f"{name}={'вкл' if retr[key] else 'выкл'}"
                         for key, name in RETR_LABELS.items())
-        print(f"Ретривал: {enh}, top_k={retr['top_k']}, дедуп по статье={'вкл' if retr['dedup'] else 'выкл'}")
+        print(f"Ретривал: {enh}, top_k={retr['top_k']}, дедуп по статье={'вкл' if retr['dedup'] else 'выкл'}, "
+              f"grounding-инструкция={'вкл' if retr['grounding'] else 'выкл'}")
     elif sub == "clear":
         rag_index.clear()
         rag_on = False
@@ -437,12 +457,12 @@ def handle_legal_command(arg: str, params: GenParams, model: str, retr: dict,
         session.save()
         if rag_index and rag_index.entries:
             rag_on = True
-        print("Юридический режим ВКЛ:")
+        print("Юридический режим ВКЛ — все оптимизации (RAG включён):")
         print("  систем-промпт — юр-агент (факты, ссылки на статьи, без гарантий исхода, не заменяет юриста)")
         pk = ", ".join(f"{k}={v}" for k, v in PRESETS["legal"].items())
         print(f"  генерация — preset legal ({pk})")
-        print(f"  ретривал  — top_k={retr['top_k']}, дедуп по статье, фильтр релевантности; "
-              f"rewrite/rerank выкл (жгут контекст на reasoning-модели)")
+        print(f"  ретривал  — top_k={retr['top_k']}, дедуп по статье, rewrite+rerank+фильтр, grounding-инструкция")
+        print("  ⚠ rewrite и rerank — по одному LLM-вызову на сообщение (медленнее; при желании /rag rerank off)")
         if not (rag_index and rag_index.entries):
             print("  ⚠ RAG-индекс пуст — добавьте документ: /rag add <путь>")
     else:
@@ -450,9 +470,9 @@ def handle_legal_command(arg: str, params: GenParams, model: str, retr: dict,
         retr.update(BASE_RETR)
         session.system_prompt = default_system
         session.save()
-        print("Юридический режим ВЫКЛ (базовый вариант для сравнения «до/после»):")
-        print(f"  систем-промпт — сброшен к исходному{' (пустой)' if not default_system else ''}; "
-              f"генерация — дефолты модели; ретривал — top_k={retr['top_k']}, без дедупа и фильтра")
+        print("Юридический режим ВЫКЛ — голый RAG без оптимизаций (RAG включён):")
+        print(f"  систем-промпта нет{' (исходный пустой)' if not default_system else ' (восстановлен исходный)'}; "
+              f"дефолты модели; ретривал top_k={retr['top_k']}, без дедупа/фильтра/rewrite/rerank и без grounding-инструкции")
     return rag_on
 
 
@@ -534,8 +554,8 @@ def main() -> int:
     context_limit = effective_context(params, model, hw_context)
     rag_index = None
     rag_on = False
-    # настройки ретривала (работают только при включённом RAG); top_k/dedup — под юр-режим
-    retr = {"rewrite": True, "rerank": True, "filter": True, "top_k": TOP_K, "dedup": False}
+    # настройки ретривала (работают только при включённом RAG); top_k/dedup/grounding — под юр-режим
+    retr = {"rewrite": True, "rerank": True, "filter": True, "top_k": TOP_K, "dedup": False, "grounding": True}
     debug = True   # строка статистики после каждого ответа
     tokens_used = 0  # ~размер последнего запроса по данным usage или оценке
 
@@ -672,24 +692,29 @@ def main() -> int:
                 if retr["filter"]:
                     hits = relevance_filter(hits)
                 hits = rerank(client, model, query, hits) if retr["rerank"] else hits[:eff_top_k]
-                # порог уверенности: релевантного нет -> честно «не знаю», без вызова модели
-                if not hits or best_score < ANSWER_MIN_SCORE:
-                    if debug:
-                        print(f"[RAG: релевантность низкая (лучший score {best_score:.2f} "
-                              f"< {ANSWER_MIN_SCORE}) — отвечаю «не знаю»]")
-                    print("LLM: Не знаю — в проиндексированных документах нет достаточно "
-                          "релевантной информации по вашему вопросу. Уточните формулировку "
-                          "или добавьте нужный документ через «/rag add».")
-                    continue
-                rag_hits = hits
-                chunks = "\n---\n".join(f"[{i}] {h['text']}" for i, h in enumerate(hits, 1))
-                rag_context = (
-                    "Отвечай, опираясь ТОЛЬКО на пронумерованные фрагменты ниже. Если в них "
-                    "нет ответа — напиши «Не знаю» и попроси уточнить, ничего не выдумывай.\n\n"
-                    + chunks
-                )
+                # grounding-режим (юр-агент): порог уверенности + строгая инструкция «только по фрагментам»
+                if retr["grounding"]:
+                    if not hits or best_score < ANSWER_MIN_SCORE:
+                        if debug:
+                            print(f"[RAG: релевантность низкая (лучший score {best_score:.2f} "
+                                  f"< {ANSWER_MIN_SCORE}) — отвечаю «не знаю»]")
+                        print("LLM: Не знаю — в проиндексированных документах нет достаточно "
+                              "релевантной информации по вашему вопросу. Уточните формулировку "
+                              "или добавьте нужный документ через «/rag add».")
+                        continue
+                    rag_hits = hits
+                    chunks = "\n---\n".join(f"[{i}] {h['text']}" for i, h in enumerate(hits, 1))
+                    rag_context = (
+                        "Отвечай, опираясь ТОЛЬКО на пронумерованные фрагменты ниже. Если в них "
+                        "нет ответа — напиши «Не знаю» и попроси уточнить, ничего не выдумывай.\n\n"
+                        + chunks
+                    )
+                else:
+                    # голый RAG (baseline): просто подставляем найденное, без порога и без инструкций
+                    rag_hits = hits
+                    rag_context = "\n---\n".join(f"[{i}] {h['text']}" for i, h in enumerate(hits, 1))
                 if debug:
-                    print(f"[RAG: {len(hits)} фрагментов, лучший score {best_score:.2f}]")
+                    print(f"[RAG: {len(rag_hits)} фрагментов, лучший score {best_score:.2f}]")
             except (APIConnectionError, APIError) as e:
                 print(f"[RAG не сработал: {e}]")
 
@@ -715,9 +740,7 @@ def main() -> int:
         if rag_hits:
             print("\nИсточники:")
             for i, h in enumerate(rag_hits, 1):
-                # chunk_id и score — отладочные, показываем только в /debug
-                extra = f" · chunk {h['chunk_id']} · score {h['score']:.2f}" if debug else ""
-                print(f"  [{i}] {Path(h['source']).name} · {section_of(h['text'])}{extra}")
+                print(f"  [{i}] {Path(h['source']).name} · {section_of(h['text'])}")
             print("Цитаты:")
             for i, h in enumerate(rag_hits, 1):
                 frag = " ".join(h["text"].split())[:220]

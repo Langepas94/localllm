@@ -199,6 +199,17 @@ def main():
         raise SystemExit("Индекс пуст. Соберите его: python scripts/build_index.py (нужен PDF в corpus/).")
     agent = Agent(client, args.model, index)
 
+    # Прогрев: грузим обе модели (эмбеддер + чат) в память сразу, чтобы ПЕРВЫЙ реальный
+    # запрос после старта/рестарта не ждал холодную загрузку (на слабом VPS это минуты).
+    # При MAX_LOADED_MODELS=2 обе останутся резидентно -> запросы без перезагрузок.
+    try:
+        index._embed(["прогрев"])
+        client.chat.completions.create(model=args.model,
+                                       messages=[{"role": "user", "content": "ок"}], max_tokens=1)
+        print("Модели прогреты (эмбеддер + чат загружены).")
+    except Exception as e:  # прогрев не критичен — сервис поднимется и так
+        print(f"Прогрев не удался (не критично): {e}")
+
     server = ThreadingHTTPServer((args.host, args.port), make_handler(agent, args.embed_model))
     print(f"Агент по трудовому праву: http://{args.host}:{args.port}  "
           f"(модель {args.model}, эмбеддинги {args.embed_model}, чанков {len(index.entries)})")

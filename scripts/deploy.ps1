@@ -59,8 +59,8 @@ fi
 
 # 3. Индекс ТК РФ — собрать вашим rag.py, только если его ещё нет (артефакт, не в git)
 if [ ! -f data/rag_index.json ]; then
-  echo "==> build RAG index from corpus/ (rag.py, bge-m3 via Ollama)"
-  .venv/bin/python scripts/build_index.py --url http://127.0.0.1:11434/v1 --embed-model bge-m3
+  echo "==> build RAG index from corpus/ (rag.py, nomic-embed-text via Ollama)"
+  .venv/bin/python scripts/build_index.py --url http://127.0.0.1:11434/v1 --embed-model nomic-embed-text
 else
   echo "==> index already present, skip build"
 fi

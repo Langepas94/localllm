@@ -199,16 +199,19 @@ def main():
         raise SystemExit("Индекс пуст. Соберите его: python scripts/build_index.py (нужен PDF в corpus/).")
     agent = Agent(client, args.model, index)
 
-    # Прогрев: грузим обе модели (эмбеддер + чат) в память сразу, чтобы ПЕРВЫЙ реальный
-    # запрос после старта/рестарта не ждал холодную загрузку (на слабом VPS это минуты).
-    # При MAX_LOADED_MODELS=2 обе останутся резидентно -> запросы без перезагрузок.
-    try:
-        index._embed(["прогрев"])
-        client.chat.completions.create(model=args.model,
-                                       messages=[{"role": "user", "content": "ок"}], max_tokens=1)
-        print("Модели прогреты (эмбеддер + чат загружены).")
-    except Exception as e:  # прогрев не критичен — сервис поднимется и так
-        print(f"Прогрев не удался (не критично): {e}")
+    # Прогрев в ФОНЕ: грузим обе модели (эмбеддер + чат) в память, чтобы запросы шли без
+    # холодной загрузки (на слабом VPS это минуты). В отдельном потоке — чтобы порт
+    # открылся сразу (запрос во время прогрева будет медленным, но не с ошибкой связи).
+    # При MAX_LOADED_MODELS=2 обе модели останутся резидентно -> запросы без перезагрузок.
+    def _warmup():
+        try:
+            index._embed(["прогрев"])
+            client.chat.completions.create(model=args.model,
+                                           messages=[{"role": "user", "content": "ок"}], max_tokens=1)
+            print("Модели прогреты (эмбеддер + чат загружены).")
+        except Exception as e:  # прогрев не критичен
+            print(f"Прогрев не удался (не критично): {e}")
+    threading.Thread(target=_warmup, daemon=True).start()
 
     server = ThreadingHTTPServer((args.host, args.port), make_handler(agent, args.embed_model))
     print(f"Агент по трудовому праву: http://{args.host}:{args.port}  "
